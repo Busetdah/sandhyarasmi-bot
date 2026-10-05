@@ -49,10 +49,10 @@ except ImportError:
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "sandhya_proxy_secret_8899")
 WORKER_BASE_URL = os.environ.get("WORKER_BASE_URL", "https://tg-relay.sandhyarasmi.workers.dev").rstrip("/")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "default_token")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "rajaibelis123")
 CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/data/cache.db")
 COOKIES_FILE_PATH = os.environ.get("COOKIES_FILE_PATH", "/data/cookies.txt")
-MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 19 * 1024 * 1024))  # stay under ~20MB
+MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
 EXTRACT_TIMEOUT = int(os.environ.get("EXTRACT_TIMEOUT", 30))
 COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 1.5))
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
@@ -2522,9 +2522,50 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             await status_msg.delete()
                         except Exception:
                             pass
-                    return
                 except Exception as e:
-                    log.warning("reply_media_group failed for %s: %s", url, e)
+                    log.warning("reply_media_group with relay URLs failed for %s: %s (attempting buffer upload fallback)", url, e)
+                    try:
+                        buf_media_list = []
+                        for idx, it in enumerate(items[:10]):
+                            c = caption if idx == 0 else None
+                            pm = ParseMode.HTML if (idx == 0 and c) else None
+                            fetch_url = it.get("url")
+                            r = await asyncio.to_thread(requests.get, fetch_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                            if r.status_code != 200:
+                                r = await asyncio.to_thread(requests.get, build_relay_url(fetch_url, it["kind"]), timeout=15)
+                            if r.status_code == 200 and r.content:
+                                buf = io.BytesIO(r.content)
+                                if it["kind"] == "photo":
+                                    buf.name = f"photo_{idx}.jpg"
+                                    buf_media_list.append(InputMediaPhoto(media=buf, caption=c, parse_mode=pm))
+                                else:
+                                    buf.name = f"video_{idx}.mp4"
+                                    buf_media_list.append(InputMediaVideo(media=buf, caption=c, parse_mode=pm, supports_streaming=True))
+                        if buf_media_list:
+                            sent_msgs = await message.reply_media_group(media=buf_media_list)
+                            cache_items = []
+                            for sm in sent_msgs:
+                                if sm.photo:
+                                    cache_items.append({"kind": "photo", "file_id": sm.photo[-1].file_id})
+                                elif sm.video:
+                                    cache_items.append({"kind": "video", "file_id": sm.video.file_id})
+                            cache_set_album(url, cache_items, caption)
+                            log.info("Successfully sent and cached album via buffer upload for %s", url)
+                            if status_msg:
+                                try:
+                                    await status_msg.delete()
+                                except Exception:
+                                    pass
+                            return
+                    except Exception as e2:
+                        log.error("Album buffer upload fallback failed for %s: %s", url, e2)
+                        err_msg = f"⚠️ Maaf, gagal memuat album media. Link asli: {url}"
+                        if status_msg:
+                            await status_msg.edit_text(err_msg)
+                        else:
+                            await message.reply_text(err_msg)
+                        return
+                    return
 
         # 3. Handle Single Item (Animation / Video / Photo)
         platform = detect_platform_name(url)
