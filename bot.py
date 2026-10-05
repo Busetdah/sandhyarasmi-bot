@@ -79,6 +79,7 @@ SUPPORTED_HOST_HINTS = (
     "twitter.com", "x.com",
     "pinterest.com", "pin.it",
     "facebook.com", "fb.watch",
+    "youtube.com", "youtu.be",
 )
 
 PROCESS_LOCK = asyncio.Semaphore(1)
@@ -90,26 +91,20 @@ USER_AI_LAST_SEEN: dict[int, float] = {}
 # Helpers: Media Probing (Width, Height, Duration, Thumbnail)
 # ---------------------------------------------------------------------------
 
-def extract_video_meta_and_thumb(video_bytes: bytes) -> tuple[int | None, int | None, int | None, bytes | None]:
-    """Inspect video bytes with ffprobe/ffmpeg to extract accurate width, height, duration, and thumbnail poster."""
+def extract_video_meta_and_thumb_file(file_path: str) -> tuple[int | None, int | None, int | None, bytes | None]:
+    """Inspect video file on disk with ffprobe/ffmpeg to extract accurate width, height, duration, and thumbnail poster."""
     w, h, dur, thumb_bytes = None, None, None, None
-    temp_name = None
-    thumb_name = None
+    thumb_name = file_path + "_thumb.jpg"
     try:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-            tf.write(video_bytes)
-            temp_name = tf.name
-        thumb_name = temp_name + "_thumb.jpg"
-
         # 1. ffprobe width, height, duration
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height,duration",
             "-of", "json",
-            temp_name,
+            file_path,
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if res.returncode == 0:
             data = json.loads(res.stdout)
             streams = data.get("streams", [])
@@ -122,26 +117,41 @@ def extract_video_meta_and_thumb(video_bytes: bytes) -> tuple[int | None, int | 
         # 2. ffmpeg thumbnail generator at 1.0s
         cmd_thumb = [
             "ffmpeg", "-y", "-ss", "00:00:01",
-            "-i", temp_name,
+            "-i", file_path,
             "-vframes", "1",
             "-q:v", "2",
             thumb_name,
         ]
-        subprocess.run(cmd_thumb, capture_output=True, timeout=5)
+        subprocess.run(cmd_thumb, capture_output=True, timeout=10)
         if os.path.exists(thumb_name) and os.path.getsize(thumb_name) > 0:
             with open(thumb_name, "rb") as tf:
                 thumb_bytes = tf.read()
     except Exception as e:
-        log.warning("extract_video_meta_and_thumb error: %s", e)
+        log.warning("extract_video_meta_and_thumb_file error: %s", e)
     finally:
-        for p in [temp_name, thumb_name]:
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+        if os.path.exists(thumb_name):
+            try:
+                os.remove(thumb_name)
+            except OSError:
+                pass
 
     return w, h, dur, thumb_bytes
+
+
+def extract_video_meta_and_thumb(video_bytes: bytes) -> tuple[int | None, int | None, int | None, bytes | None]:
+    """Inspect video bytes with ffprobe/ffmpeg to extract accurate width, height, duration, and thumbnail poster."""
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+            tf.write(video_bytes)
+            temp_name = tf.name
+        return extract_video_meta_and_thumb_file(temp_name)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            try:
+                os.remove(temp_name)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -532,8 +542,6 @@ def cache_set_album(url: str, items: list, caption: str | None = None):
 # ---------------------------------------------------------------------------
 
 def looks_supported(url: str) -> bool:
-    if any(yt in url.lower() for yt in ["youtube.com", "youtu.be"]):
-        return False
     return any(host in url.lower() for host in SUPPORTED_HOST_HINTS)
 
 
@@ -553,6 +561,8 @@ def detect_platform_name(url: str) -> str:
         return "pinterest"
     elif "facebook.com" in url_lower or "fb.watch" in url_lower:
         return "facebook"
+    elif "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
     return "source"
 
 
@@ -1185,9 +1195,6 @@ def og_scrape_fallback(url: str) -> dict | None:
 
 
 def extract_info(url: str) -> dict | None:
-    if any(yt in url.lower() for yt in ["youtube.com", "youtu.be"]):
-        return None
-
     if "tiktok.com" in url.lower():
         tt_info = extract_tiktok(url)
         if tt_info:
@@ -1351,10 +1358,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 **tg-relay-bot** siap mengunduh dan mem-post media secara instan & utuh di grup!\n\n"
         "🌐 **Platform Didukung**:\n"
         "• 🎵 **TikTok** (`video`, `photo slide`)\n"
-        "• 🤖 **Reddit** (`video HD 9:16`, `animasi GIF`, `gallery`, `post teks`)\n"
         "• 📸 **Instagram** (`reel`, `post`, `carousel`)\n"
+        "• 🎥 **YouTube** (`shorts`, `video hingga 50MB`)\n"
+        "• 🤖 **Reddit** (`video HD`, `animasi GIF`, `gallery`, `post teks`)\n"
         "• 🧵 **Threads** (`post`, `multi-images`)\n"
-        "• 🐦 **X / Twitter** (`x.com`)\n\n"
+        "• 🐦 **X / Twitter** (`x.com`)\n"
+        "• 📘 **Facebook** (`video`, `reels`)\n\n"
         "👇 **Gunakan tombol di bawah untuk melihat menu dan panduan:**"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard())
@@ -2038,10 +2047,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "🤖 **tg-relay-bot** siap mengunduh dan mem-post media secara instan & utuh di grup!\n\n"
             "🌐 **Platform Didukung**:\n"
             "• 🎵 **TikTok** (`video`, `photo slide`)\n"
-            "• 🤖 **Reddit** (`video HD 9:16`, `animasi GIF`, `gallery`, `post teks`)\n"
             "• 📸 **Instagram** (`reel`, `post`, `carousel`)\n"
+            "• 🎥 **YouTube** (`shorts`, `video hingga 50MB`)\n"
+            "• 🤖 **Reddit** (`video HD`, `animasi GIF`, `gallery`, `post teks`)\n"
             "• 🧵 **Threads** (`post`, `multi-images`)\n"
-            "• 🐦 **X / Twitter** (`x.com`)\n\n"
+            "• 🐦 **X / Twitter** (`x.com`)\n"
+            "• 📘 **Facebook** (`video`, `reels`)\n\n"
             "👇 **Gunakan tombol di bawah untuk navigasi cepat:**"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard())
@@ -2241,6 +2252,149 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_link(url, message, context)
 
 
+async def download_and_send_via_ytdlp(
+    url: str,
+    message,
+    caption: str,
+    status_msg=None,
+    max_mb: int = 49
+) -> bool:
+    """Download video/audio directly using yt-dlp with best quality under 50MB and upload to Telegram."""
+    if status_msg:
+        try:
+            await status_msg.edit_text("⏳ Sedang mengunduh media resolusi tinggi...")
+        except Exception:
+            pass
+
+    temp_id = int(time.time() * 1000)
+    temp_dir = os.environ.get("TEMP_DIR", "/app/temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    out_template = os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s")
+    final_mp4 = os.path.join(temp_dir, f"dl_{temp_id}.mp4")
+
+    # Format selector: best video + best audio merged into mp4 under max_mb
+    format_spec = f"bestvideo[filesize<{max_mb}M]+bestaudio/best[filesize<{max_mb}M]/best[filesize_approx<{max_mb}M]/best"
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-f", format_spec,
+        "--merge-output-format", "mp4",
+        "--max-filesize", f"{max_mb}M",
+        "-o", out_template,
+    ]
+    if has_active_cookies():
+        cmd.extend(["--cookies", COOKIES_FILE_PATH])
+    cmd.append(url)
+
+    log.info("Starting yt-dlp direct download for %s", url)
+    try:
+        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=120)
+        
+        # Locate the downloaded file
+        actual_file = None
+        if os.path.exists(final_mp4) and os.path.getsize(final_mp4) > 0:
+            actual_file = final_mp4
+        else:
+            for f in os.listdir(temp_dir):
+                if f.startswith(f"dl_{temp_id}"):
+                    p = os.path.join(temp_dir, f)
+                    if os.path.getsize(p) > 0:
+                        actual_file = p
+                        break
+
+        if not actual_file:
+            log.warning("yt-dlp download failed for %s (exit code %s): %s", url, proc.returncode, proc.stderr[-300:] if proc.stderr else proc.stdout[-300:])
+            # Fallback with simple -f best
+            cmd_fallback = [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--max-filesize", f"{max_mb}M",
+                "--merge-output-format", "mp4",
+                "-o", out_template,
+                url
+            ]
+            if has_active_cookies():
+                cmd_fallback.insert(-1, "--cookies")
+                cmd_fallback.insert(-1, COOKIES_FILE_PATH)
+            proc2 = await asyncio.to_thread(subprocess.run, cmd_fallback, capture_output=True, text=True, timeout=120)
+            if os.path.exists(final_mp4) and os.path.getsize(final_mp4) > 0:
+                actual_file = final_mp4
+            else:
+                for f in os.listdir(temp_dir):
+                    if f.startswith(f"dl_{temp_id}"):
+                        p = os.path.join(temp_dir, f)
+                        if os.path.getsize(p) > 0:
+                            actual_file = p
+                            break
+
+        if not actual_file:
+            log.warning("All yt-dlp download attempts failed for %s", url)
+            return False
+
+        filesize = os.path.getsize(actual_file)
+        log.info("Downloaded %s successfully (size: %.2f MB)", actual_file, filesize / (1024 * 1024))
+
+        if filesize > 50 * 1024 * 1024:
+            err_msg = f"⚠️ Ukuran media ({filesize // (1024*1024)}MB) melebihi batas upload bot Telegram (50MB). Link asli: {url}"
+            if status_msg:
+                await status_msg.edit_text(err_msg)
+            else:
+                await message.reply_text(err_msg)
+            return True
+
+        if status_msg:
+            try:
+                await status_msg.edit_text("⏳ Sedang mengunggah media ke Telegram...")
+            except Exception:
+                pass
+
+        # Extract metadata and thumbnail
+        w, h, dur, thumb_bytes = await asyncio.to_thread(extract_video_meta_and_thumb_file, actual_file)
+        thumb_file = io.BytesIO(thumb_bytes) if thumb_bytes else None
+        if thumb_file:
+            thumb_file.name = "thumb.jpg"
+
+        with open(actual_file, "rb") as vf:
+            sent = await message.reply_video(
+                video=vf,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                width=w,
+                height=h,
+                duration=dur,
+                thumbnail=thumb_file,
+                supports_streaming=True,
+                read_timeout=180.0,
+                write_timeout=180.0,
+            )
+
+        file_id = sent.video.file_id if sent.video else ""
+        if file_id:
+            cache_set(url, "video", file_id, caption)
+            log.info("Successfully uploaded and cached media for %s (file_id=%s)", url, file_id)
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        return True
+
+    except Exception as e:
+        log.error("download_and_send_via_ytdlp exception for %s: %s", url, e)
+        return False
+    finally:
+        for f in os.listdir(temp_dir):
+            if f.startswith(f"dl_{temp_id}"):
+                try:
+                    os.remove(os.path.join(temp_dir, f))
+                except OSError:
+                    pass
+
+
 async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
     log.info("Processing link: %s", url)
 
@@ -2373,15 +2527,25 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                     log.warning("reply_media_group failed for %s: %s", url, e)
 
         # 3. Handle Single Item (Animation / Video / Photo)
-        direct = pick_direct_url(info)
-        if direct is None:
-            log.warning("No suitable direct url under 20MB found for %s", url)
-            err_msg = f"⚠️ Ukuran media melebihi batas URL-fetch (~20MB). Link asli: {url}"
-            if status_msg:
-                await status_msg.edit_text(err_msg)
-            else:
-                await message.reply_text(err_msg)
-            return
+        platform = detect_platform_name(url)
+        is_youtube = platform == "youtube"
+
+        direct = pick_direct_url(info) if not is_youtube else None
+        filesize = direct.get("filesize") if direct else None
+
+        # Check if direct relay is not suitable (YouTube, >20MB, or separate DASH streams)
+        if is_youtube or direct is None or (filesize and filesize > 20 * 1024 * 1024):
+            log.info("Direct relay URL not suitable (is_yt=%s, direct=%s, size=%s). Trying yt-dlp downloader for %s", is_youtube, direct is not None, filesize, url)
+            success = await download_and_send_via_ytdlp(url, message, caption, status_msg)
+            if success:
+                return
+            if direct is None:
+                err_msg = f"⚠️ Maaf, gagal mengunduh media dari link ini. Link asli: {url}"
+                if status_msg:
+                    await status_msg.edit_text(err_msg)
+                else:
+                    await message.reply_text(err_msg)
+                return
 
         kind = info.get("_kind", "photo")
         ext = direct.get("ext") or info.get("ext") or ""
@@ -2496,9 +2660,10 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             pass
                     return
 
-                log.warning("Direct URL relay failed for %s: %s (falling back to buffer upload)", url, e)
+                log.warning("Direct URL relay failed for %s: %s (falling back to yt-dlp & buffer upload)", url, e)
                 
-                # Tier 2: Stream Buffer Upload Fallback
+                # Tier 2: Stream Buffer Upload or yt-dlp Fallback
+                uploaded = False
                 try:
                     r = await asyncio.to_thread(requests.get, relay_url, timeout=35)
                     if r.status_code == 200 and r.content:
@@ -2528,6 +2693,7 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                                 supports_streaming=True,
                             )
                             file_id = sent.video.file_id if sent.video else (sent.document.file_id if sent.document else "")
+                            uploaded = True
                         elif kind == "animation":
                             sent = await message.reply_animation(
                                 animation=buf,
@@ -2539,6 +2705,7 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                                 thumbnail=thumb_file or thumb_input,
                             )
                             file_id = sent.animation.file_id if sent.animation else (sent.document.file_id if sent.document else "")
+                            uploaded = True
                         else:
                             sent = await message.reply_photo(
                                 photo=buf,
@@ -2546,13 +2713,19 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                                 parse_mode=ParseMode.HTML,
                             )
                             file_id = sent.photo[-1].file_id if sent.photo else ""
+                            uploaded = True
                 except Exception as e2:
-                    log.error("Buffer upload fallback also failed for %s: %s", url, e2)
-                    err_msg = f"⚠️ Maaf, gagal memuat media. Link asli: {url}"
-                    if status_msg:
-                        await status_msg.edit_text(err_msg)
-                    else:
-                        await message.reply_text(err_msg)
+                    log.warning("Buffer upload fallback failed for %s: %s", url, e2)
+
+                if not uploaded:
+                    log.info("Trying yt-dlp direct download fallback for %s", url)
+                    success = await download_and_send_via_ytdlp(url, message, caption, status_msg)
+                    if not success:
+                        err_msg = f"⚠️ Maaf, gagal memuat media. Link asli: {url}"
+                        if status_msg:
+                            await status_msg.edit_text(err_msg)
+                        else:
+                            await message.reply_text(err_msg)
                     return
 
             if status_msg and not was_edited:
@@ -2699,10 +2872,10 @@ def main():
         builder
         .post_init(post_init)
         .get_updates_read_timeout(30.0)
-        .read_timeout(60.0)
-        .write_timeout(60.0)
-        .connect_timeout(30.0)
-        .pool_timeout(60.0)
+        .read_timeout(180.0)
+        .write_timeout(180.0)
+        .connect_timeout(60.0)
+        .pool_timeout(180.0)
         .build()
     )
     app.add_handler(CommandHandler("start", start_command))
