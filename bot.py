@@ -47,7 +47,7 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8789659912:AAE9U4epvUzkuMgEMaH0eBS_cJS1USU-pGY")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "sandhya_proxy_secret_8899")
 WORKER_BASE_URL = os.environ.get("WORKER_BASE_URL", "https://tg-relay.sandhyarasmi.workers.dev").rstrip("/")
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "default_token")
 CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/data/cache.db")
@@ -2659,9 +2659,16 @@ async def post_init(application: Application):
 # ---------------------------------------------------------------------------
 
 def main():
+    tg_base_url = os.environ.get("TELEGRAM_API_BASE_URL", "").strip()
+    builder = Application.builder().token(BOT_TOKEN)
+    if tg_base_url:
+        builder = (
+            builder
+            .base_url(tg_base_url)
+            .base_file_url(f"{tg_base_url}/file")
+        )
     app = (
-        Application.builder()
-        .token(BOT_TOKEN)
+        builder
         .post_init(post_init)
         .get_updates_read_timeout(30.0)
         .read_timeout(60.0)
