@@ -1,0 +1,11 @@
+﻿services:
+  sandhyarasmi-bot:
+    build: .
+    container_name: sandhyarasmi-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./bot.py:/app/bot.py
+      - ./video_processor.py:/app/video_processor.py
+      - ./config.py:/app/config.py
