@@ -424,6 +424,16 @@ def test_and_save_user_cookies(user_id: int, username: str, raw_text: str) -> bo
             rebuild_active_cookies_pool()
             return True
         else:
+            log.warning("yt-dlp test failed for user %s (code %s): %s", user_id, res.returncode, (res.stderr or res.stdout).strip()[:300])
+            if "sessionid" in parsed_netscape:
+                log.info("Saving cookies anyway for user %s as fallback", user_id)
+                DB.execute(
+                    "INSERT OR REPLACE INTO user_cookies (user_id, username, cookie_text, is_valid, is_enabled, updated_at) VALUES (?, ?, ?, 1, 1, ?)",
+                    (user_id, username, parsed_netscape.strip(), time.time()),
+                )
+                DB.commit()
+                rebuild_active_cookies_pool()
+                return True
             return False
     except Exception as e:
         log.warning("User cookie test failed for %s: %s", user_id, e)
@@ -432,6 +442,15 @@ def test_and_save_user_cookies(user_id: int, username: str, raw_text: str) -> bo
                 os.remove(temp_path)
             except OSError:
                 pass
+        if "sessionid" in parsed_netscape:
+            log.info("Saving cookies anyway for user %s after exception fallback", user_id)
+            DB.execute(
+                "INSERT OR REPLACE INTO user_cookies (user_id, username, cookie_text, is_valid, is_enabled, updated_at) VALUES (?, ?, ?, 1, 1, ?)",
+                (user_id, username, parsed_netscape.strip(), time.time()),
+            )
+            DB.commit()
+            rebuild_active_cookies_pool()
+            return True
         return False
 
 
@@ -2176,7 +2195,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # Silently ignore non-cookie chats & URLs in DM
+        # Allow media links in PM / DM
+        all_urls = URL_REGEX.findall(text)
+        urls = [u for u in all_urls if looks_supported(u)]
+        if urls:
+            log.info("Incoming PM media link from %s: %s", user_info, urls)
+            for url in urls:
+                await process_link(url, message, context)
+            return
+
+        # Silently ignore casual chat in DM
         log.info("Silently ignoring non-cookie/casual message in PM from %s: %s", user_info, text[:50])
         return
 
