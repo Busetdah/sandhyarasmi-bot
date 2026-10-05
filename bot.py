@@ -15,11 +15,6 @@ import tempfile
 import time
 from urllib.parse import quote
 
-
-from video_processor import probe_video as hd_probe_video, encode_story_video as hd_encode_story_video
-from config import PRESETS as HD_PRESETS, SUPPORTED_EXTENSIONS as HD_SUPPORTED_EXT
-from telegram import InputFile
-from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from telegram import (
@@ -2017,88 +2012,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     user = query.from_user
 
-    # Handle HD Story & Reels callbacks
-    if data.startswith("hd_cancel:"):
-        session_id = data.split(":")[1]
-        session = HD_STORY_SESSIONS.pop(session_id, None)
-        if session:
-            import shutil
-            shutil.rmtree(session["session_dir"], ignore_errors=True)
-        await query.edit_message_text("❌ Proses optimasi video dibatalkan.")
-        return
-
-    elif data.startswith("hd_preset:"):
-        parts = data.split(":")
-        preset_key = parts[1]
-        session_id = parts[2]
-        session = HD_STORY_SESSIONS.get(session_id)
-        if not session:
-            await query.edit_message_text("⚠️ Sesi pemrosesan telah kedaluwarsa. Silakan kirim ulang video Anda.")
-            return
-
-        preset_cfg = HD_PRESETS.get(preset_key, HD_PRESETS["wa_1080p"])
-        await query.edit_message_text(
-            f"⚙️ **Sedang Memproses Video Story...**\n\n"
-            f"🎯 Preset: **{preset_cfg['name']}**\n"
-            f"🎞️ Target: `{preset_cfg['target_w']}x{preset_cfg['target_h']} @ {preset_cfg['fps']} FPS CFR`\n"
-            f"⏳ *Mohon tunggu sebentar, encoding video di Raspberry Pi sedang berjalan...*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        input_path = session["input_path"]
-        output_filename = f"HD_{preset_cfg['target'].upper()}_{Path(session['original_filename']).stem}.mp4"
-        output_path = session["session_dir"] / output_filename
-        start_time = time.time()
-
-        try:
-            success, msg = await hd_encode_story_video(
-                input_path=input_path,
-                output_path=output_path,
-                preset_key=preset_key,
-                meta=session["meta"]
-            )
-            if not success:
-                await query.edit_message_text(f"❌ Gagal merender video: `{msg}`", parse_mode=ParseMode.MARKDOWN)
-                import shutil
-                shutil.rmtree(session["session_dir"], ignore_errors=True)
-                HD_STORY_SESSIONS.pop(session_id, None)
-                return
-
-            elapsed_sec = round(time.time() - start_time, 1)
-            out_meta = await hd_probe_video(output_path)
-            orig_meta = session["meta"]
-
-            caption = (
-                f"🚀 **Video Siap Di-Upload ke Story!**\n\n"
-                f"🎯 **Preset:** {preset_cfg['name']}\n"
-                f"⏱️ **Waktu Render:** `{elapsed_sec} detik`\n\n"
-                f"📊 **Perbandingan Kualitas:**\n"
-                f"• **Resolusi:** `{orig_meta['width']}x{orig_meta['height']}` ➔ `{out_meta['width']}x{out_meta['height']}`\n"
-                f"• **Framerate:** `{orig_meta['fps']} FPS` ➔ `{out_meta['fps']} FPS (Strict CFR 60)`\n"
-                f"• **Bitrate:** `{orig_meta['bitrate_kbps']} kbps` ➔ `{out_meta['bitrate_kbps']} kbps (Optimized)`\n"
-                f"• **Ukuran File:** `{orig_meta['file_size_mb']} MB` ➔ `{out_meta['file_size_mb']} MB`\n\n"
-                f"💡 **Cara Simpan & Upload:**\n"
-                f"1. Ketuk titik tiga (⋮) pada file dokumen ini ➔ **Simpan ke Galeri**.\n"
-                f"2. Buka WhatsApp / Instagram ➔ Pilih dari galeri ➔ Upload ke Story!"
-            )
-            await query.edit_message_text("📤 **Mengirim video dokumen HD ke Telegram...**", parse_mode=ParseMode.MARKDOWN)
-            with open(output_path, "rb") as doc_file:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=InputFile(doc_file, filename=output_filename),
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            await query.delete_message()
-        except Exception as e:
-            log.error("Error during encoding: %s", e)
-            await query.edit_message_text(f"❌ Terjadi kesalahan: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
-        finally:
-            import shutil
-            shutil.rmtree(session["session_dir"], ignore_errors=True)
-            HD_STORY_SESSIONS.pop(session_id, None)
-        return
-
     if data == "btn_main_menu":
         user_name = user.first_name if user else "User"
         text = (
@@ -2177,110 +2090,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-
-# ---------------------------------------------------------------------------
-# HD Story & Reels Video Optimizer (Owner Exclusive - thisistag)
-# ---------------------------------------------------------------------------
-HD_STORY_SESSIONS = {}
-HD_TEMP_DIR = Path("/tmp/hd_story_temp")
-HD_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-def hd_format_duration(seconds: float) -> str:
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{mins:02d}:{secs:02d}"
-
-async def handle_hd_story_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
-    if message.chat.type != ChatType.PRIVATE:
-        return
-    user = message.from_user
-    if not is_owner(user):
-        return
-
-    video_obj = None
-    original_filename = "video.mp4"
-    
-    if message.video:
-        video_obj = message.video
-        original_filename = video_obj.file_name or f"video_{int(time.time())}.mp4"
-    elif message.document:
-        doc = message.document
-        ext = Path(doc.file_name or "").suffix.lower()
-        mime = doc.mime_type or ""
-        if "video" in mime or ext in HD_SUPPORTED_EXT:
-            video_obj = doc
-            original_filename = doc.file_name or f"video_{int(time.time())}.mp4"
-
-    if not video_obj:
-        return
-
-    file_size_mb = video_obj.file_size / (1024 * 1024)
-    if file_size_mb > 200:
-        await message.reply_text(f"❌ Ukuran file terlalu besar ({file_size_mb:.1f} MB). Maksimal 200 MB.")
-        return
-
-    status_msg = await message.reply_text("📥 **Mengunduh video ke server...**", parse_mode=ParseMode.MARKDOWN)
-    
-    session_id = str(time.time()).replace(".", "")[-8:]
-    session_dir = HD_TEMP_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    input_file_path = session_dir / f"input_{original_filename}"
-
-    try:
-        tg_file = await context.bot.get_file(video_obj.file_id)
-        if tg_file.file_path and os.path.exists(tg_file.file_path):
-            import shutil
-            shutil.copy2(tg_file.file_path, input_file_path)
-        else:
-            await tg_file.download_to_drive(custom_path=input_file_path)
-        
-        await status_msg.edit_text("🔍 **Menganalisis metadata video (Resolusi, FPS, Bitrate)...**", parse_mode=ParseMode.MARKDOWN)
-        meta = await hd_probe_video(input_file_path)
-
-        HD_STORY_SESSIONS[session_id] = {
-            "input_path": input_file_path,
-            "session_dir": session_dir,
-            "original_filename": original_filename,
-            "meta": meta,
-            "user_id": user.id
-        }
-
-        keyboard = [
-            [InlineKeyboardButton("📱 WhatsApp Status 1080p", callback_data=f"hd_preset:wa_1080p:{session_id}"),
-             InlineKeyboardButton("⚡ WA 720p", callback_data=f"hd_preset:wa_720p:{session_id}")],
-            [InlineKeyboardButton("📸 Instagram Story/Reels HD", callback_data=f"hd_preset:ig_story:{session_id}")],
-            [InlineKeyboardButton("🍎 iPhone Pro HDR (Glossy)", callback_data=f"hd_preset:iphone_hdr:{session_id}"),
-             InlineKeyboardButton("🔥 TikTok 4K CC (Pop)", callback_data=f"hd_preset:tiktok_4k:{session_id}")]
-        ]
-        if not meta["is_vertical_9_16"] or meta["width"] > meta["height"]:
-            keyboard.append([InlineKeyboardButton("🎨 Auto 9:16 + Blurred Background", callback_data=f"hd_preset:blur_bg_1080p:{session_id}")])
-        keyboard.append([InlineKeyboardButton("❌ Batalkan", callback_data=f"hd_cancel:{session_id}")])
-
-        ratio_note = "✅ 9:16 Vertikal" if meta["is_vertical_9_16"] else f"⚠️ {meta['aspect_ratio']} (Non-9:16)"
-
-        info_text = (
-            "📊 **Analisis Video Story Berhasil!**\n\n"
-            f"• **Nama File:** `{original_filename}`\n"
-            f"• **Resolusi:** `{meta['width']}x{meta['height']}` ({ratio_note})\n"
-            f"• **Framerate:** `{meta['fps']} FPS`\n"
-            f"• **Bitrate Asli:** `{meta['bitrate_kbps']} kbps`\n"
-            f"• **Ukuran:** `{meta['file_size_mb']} MB`\n"
-            f"• **Durasi:** `{hd_format_duration(meta['duration'])}`\n"
-            f"• **Audio:** `{'Ada' if meta['has_audio'] else 'Mute (Tanpa Suara)'}`\n\n"
-            "🎯 **Pilih Preset Optimasi yang Kamu Inginkan:**"
-        )
-        await status_msg.edit_text(info_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-    except Exception as e:
-        log.error("Error handling HD story video: %s", e)
-        await status_msg.edit_text(f"❌ Gagal menganalisis video: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
-        import shutil
-        shutil.rmtree(session_dir, ignore_errors=True)
-        HD_STORY_SESSIONS.pop(session_id, None)
-
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message or not message.document:
@@ -2291,14 +2100,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     doc = message.document
     filename = (doc.file_name or "").lower()
-    ext = Path(doc.file_name or "").suffix.lower()
-    mime = doc.mime_type or ""
-
-    # Check if this is an HD Story video document from owner
-    if ("video" in mime or ext in HD_SUPPORTED_EXT) and is_owner(user):
-        await handle_hd_story_video(update, context)
-        return
-
     if not (filename.endswith(".txt") or "cookie" in filename):
         return
 
@@ -2858,17 +2659,9 @@ async def post_init(application: Application):
 # ---------------------------------------------------------------------------
 
 def main():
-    local_api_url = os.getenv("LOCAL_BOT_API_URL", "").strip()
-    builder = Application.builder().token(BOT_TOKEN)
-    if local_api_url:
-        builder = (
-            builder
-            .base_url(f"{local_api_url}/bot")
-            .base_file_url(f"{local_api_url}/file/bot")
-            .local_mode(True)
-        )
     app = (
-        builder
+        Application.builder()
+        .token(BOT_TOKEN)
         .post_init(post_init)
         .get_updates_read_timeout(30.0)
         .read_timeout(60.0)
@@ -2894,7 +2687,6 @@ def main():
     app.add_handler(CommandHandler("resumecookies", resume_cookies_command))
     app.add_handler(CommandHandler("clearcookies", clear_cookies_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
-    app.add_handler(MessageHandler(filters.VIDEO, handle_hd_story_video))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot starting (long polling)...")

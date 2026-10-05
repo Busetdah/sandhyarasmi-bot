@@ -7,5 +7,3 @@
     volumes:
       - ./data:/data
       - ./bot.py:/app/bot.py
-      - ./video_processor.py:/app/video_processor.py
-      - ./config.py:/app/config.py
