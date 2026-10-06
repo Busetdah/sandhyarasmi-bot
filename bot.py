@@ -78,7 +78,7 @@ ROUTER_API_KEY = (
     or os.environ.get("NINEROUTER_TOKEN", "")
     or ""
 ).strip()
-ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "cbcn/deepseek-v4.1-flash(xhigh)").strip()
+ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "cbai/deepseek-v4.1-flash(xhigh)").strip()
 
 
 def get_clean_router_url(raw_url: str) -> str:
