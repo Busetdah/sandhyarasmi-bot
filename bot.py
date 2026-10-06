@@ -47,9 +47,9 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "sandhya_proxy_secret_8899")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 WORKER_BASE_URL = os.environ.get("WORKER_BASE_URL", "https://tg-relay.sandhyarasmi.workers.dev").rstrip("/")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "rajaibelis123")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/data/cache.db")
 COOKIES_FILE_PATH = os.environ.get("COOKIES_FILE_PATH", "/data/cookies.txt")
 MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
@@ -58,7 +58,7 @@ COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 1.5))
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://172.17.0.1:18080/v1/chat/completions")
 HCNSEC_API_URL = os.environ.get("HCNSEC_API_URL", "https://api.hcnsec.cn/v1/chat/completions")
-HCNSEC_API_KEY = os.environ.get("HCNSEC_API_KEY", "sk-E0Vfu05K4tK8EFVi5wPQnV2IEQNFOmQwB1QTzwJydYis6dki")
+HCNSEC_API_KEY = os.environ.get("HCNSEC_API_KEY", "")
 HCNSEC_MODEL = os.environ.get("HCNSEC_MODEL", "kat-coder-pro-v2.5")
 SEARXNG_SERVER_URL = os.environ.get("SEARXNG_SERVER_URL", "http://172.17.0.1:8080/search")
 MEMBERS_FILE_PATH = os.environ.get("MEMBERS_FILE_PATH", "/data/MEMBERS.md")

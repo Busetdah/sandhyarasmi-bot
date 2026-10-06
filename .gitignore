@@ -1,0 +1,28 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# SQLite databases & temp data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/
+temp/
+cookies.txt
+*.log
+
+# Docker & OS artifacts
+.DS_Store
+Thumbs.db
