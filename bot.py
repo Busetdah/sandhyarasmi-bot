@@ -2542,7 +2542,15 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                                     buf.name = f"video_{idx}.mp4"
                                     buf_media_list.append(InputMediaVideo(media=buf, caption=c, parse_mode=pm, supports_streaming=True))
                         if buf_media_list:
-                            sent_msgs = await message.reply_media_group(media=buf_media_list)
+                            if len(buf_media_list) == 1:
+                                single = buf_media_list[0]
+                                if isinstance(single, InputMediaPhoto):
+                                    sm = await message.reply_photo(photo=single.media, caption=single.caption, parse_mode=single.parse_mode)
+                                else:
+                                    sm = await message.reply_video(video=single.media, caption=single.caption, parse_mode=single.parse_mode, supports_streaming=True)
+                                sent_msgs = [sm]
+                            else:
+                                sent_msgs = await message.reply_media_group(media=buf_media_list)
                             cache_items = []
                             for sm in sent_msgs:
                                 if sm.photo:
