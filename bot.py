@@ -2965,9 +2965,9 @@ def main():
     app.add_handler(CommandHandler("pausecookies", pause_cookies_command))
     app.add_handler(CommandHandler("resumecookies", resume_cookies_command))
     app.add_handler(CommandHandler("clearcookies", clear_cookies_command))
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback_query, block=False))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document, block=False))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False))
     log.info("Bot starting (long polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
