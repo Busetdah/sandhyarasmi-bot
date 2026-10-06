@@ -321,9 +321,9 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%threads.%' OR url LIKE '%/share/%'")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
     except Exception as e:
-        log.warning("Failed to purge stale threads cache: %s", e)
+        log.warning("Failed to purge stale threads/tiktok cache: %s", e)
     conn.commit()
     return conn
 
@@ -719,58 +719,82 @@ def format_caption(info: dict, url: str) -> str:
 
 def extract_tiktok(url: str) -> dict | None:
     """Extract TikTok video or photo slides using TikWM API + yt-dlp fallback."""
-    try:
-        log.info("Querying TikTok via TikWM for %s", url)
-        resp = HTTP_SESSION.post("https://tikwm.com/api/", data={"url": url}, timeout=10)
-        if resp.status_code == 200:
-            res_json = resp.json()
-            if res_json.get("code") == 0:
-                data = res_json.get("data", {})
-                title = data.get("title") or ""
-                author = data.get("author", {}).get("unique_id") or data.get("author", {}).get("nickname") or ""
-                uploader = f"@{author}" if author else ""
-                duration = data.get("duration")
-                
-                images = data.get("images")
-                if images and isinstance(images, list) and len(images) > 0:
-                    log.info("TikTok photo slide detected with %d images", len(images))
-                    return {
-                        "_kind": "album",
-                        "items": [{"url": img, "kind": "photo"} for img in images],
-                        "title": title,
-                        "description": title,
-                        "uploader": uploader,
-                    }
-                
-                play_url = data.get("play") or data.get("wmplay")
-                size = data.get("size")
-                if play_url:
-                    log.info("TikTok video extracted via TikWM (size: %s bytes)", size)
-                    return {
-                        "formats": [],
-                        "url": play_url,
-                        "thumbnail": data.get("cover"),
-                        "ext": "mp4",
-                        "filesize": size,
-                        "width": data.get("width"),
-                        "height": data.get("height"),
-                        "duration": duration,
-                        "title": title,
-                        "description": title,
-                        "uploader": uploader,
-                        "_kind": "video",
-                    }
-    except Exception as e:
-        log.warning("TikWM extraction failed for %s: %s", url, e)
+    urls_to_try = [url]
+    resolved_url = None
 
+    # Resolve short links (vt.tiktok.com, vm.tiktok.com) to avoid redirect timeouts on TikWM
+    if any(k in url.lower() for k in ["vt.tiktok.com", "vm.tiktok.com"]):
+        try:
+            r = HTTP_SESSION.get(
+                url,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=12,
+            )
+            if r.status_code == 200 and r.url and r.url != url:
+                resolved_url = r.url
+                urls_to_try.append(resolved_url)
+                log.info("Resolved TikTok shortlink: %s -> %s", url, resolved_url)
+        except Exception as e:
+            log.debug("TikTok shortlink redirect error for %s: %s", url, e)
+
+    endpoints = ["https://tikwm.com/api/", "https://www.tikwm.com/api/"]
+
+    for candidate_url in urls_to_try:
+        for ep in endpoints:
+            try:
+                log.info("Querying TikTok via TikWM (%s) for %s", ep, candidate_url)
+                resp = HTTP_SESSION.post(ep, data={"url": candidate_url}, timeout=25)
+                if resp.status_code == 200:
+                    res_json = resp.json()
+                    if res_json.get("code") == 0:
+                        data = res_json.get("data", {})
+                        title = data.get("title") or ""
+                        author = data.get("author", {}).get("unique_id") or data.get("author", {}).get("nickname") or ""
+                        uploader = f"@{author}" if author else ""
+                        duration = data.get("duration")
+
+                        images = data.get("images")
+                        if images and isinstance(images, list) and len(images) > 0:
+                            log.info("TikTok photo slide detected with %d images", len(images))
+                            return {
+                                "_kind": "album",
+                                "items": [{"url": img, "kind": "photo"} for img in images],
+                                "title": title,
+                                "description": title,
+                                "uploader": uploader,
+                            }
+
+                        play_url = data.get("play") or data.get("wmplay")
+                        size = data.get("size")
+                        if play_url:
+                            log.info("TikTok video extracted via TikWM (size: %s bytes)", size)
+                            return {
+                                "formats": [],
+                                "url": play_url,
+                                "thumbnail": data.get("cover"),
+                                "ext": "mp4",
+                                "filesize": size,
+                                "width": data.get("width"),
+                                "height": data.get("height"),
+                                "duration": duration,
+                                "title": title,
+                                "description": title,
+                                "uploader": uploader,
+                                "_kind": "video",
+                            }
+            except Exception as e:
+                log.warning("TikWM (%s) extraction failed for %s: %s", ep, candidate_url, e)
+
+    # Fallback: yt-dlp
+    target_dl_url = resolved_url or url
     try:
-        r = HTTP_SESSION.get(url, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        final_url = r.url
-        info = ytdlp_extract(final_url)
+        log.info("Trying yt-dlp extraction fallback for TikTok: %s", target_dl_url)
+        info = ytdlp_extract(target_dl_url)
         if info:
             return info
     except Exception as e:
-        log.warning("TikTok yt-dlp fallback failed for %s: %s", url, e)
+        log.warning("TikTok yt-dlp fallback failed for %s: %s", target_dl_url, e)
 
     return None
 
@@ -1416,7 +1440,11 @@ def og_scrape_fallback(url: str) -> dict | None:
         if m:
             uploader = f"@{m.group(1)}"
 
-    if image_url and (any(k in image_url for k in ["redditstatic.com", "share.redd.it/preview"]) or is_avatar_url(image_url)):
+    if image_url and (
+        any(k in image_url for k in ["redditstatic.com", "share.redd.it/preview", "play-icon", "photomode-share-video"])
+        or is_avatar_url(image_url)
+        or any(k in url.lower() for k in ["tiktok.com", "vt.tiktok.com", "vm.tiktok.com"])
+    ):
         image_url = None
 
     if video_url:
