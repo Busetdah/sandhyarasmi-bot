@@ -321,7 +321,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
+        conn.execute("DELETE FROM cache WHERE caption LIKE '%blockquote%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     conn.commit()
@@ -735,11 +735,10 @@ def format_caption(info: dict, url: str) -> str:
     else:
         escaped_text = html.escape(raw_text)
 
-    # For text-only posts (no media attached), strictly output clean text blockquote with author attribution.
+    # For text-only posts (no media attached), output clean text directly with author attribution.
     # Strictly DO NOT include any hyperlinks or URLs to prevent Telegram from generating a rich link preview header with avatar.
     if is_text_only:
-        tag = "blockquote expandable" if (len(escaped_text) > 120 or "\n" in escaped_text) else "blockquote"
-        out = f"<{tag}>{escaped_text}</{tag.split()[0]}>" if escaped_text else ""
+        out = escaped_text if escaped_text else ""
         if clean_uploader:
             author_line = f"— @{html.escape(clean_uploader)}"
             out = f"{out}\n\n{author_line}" if out else author_line
@@ -752,8 +751,7 @@ def format_caption(info: dict, url: str) -> str:
     footer = " ".join(footer_parts)
 
     if escaped_text:
-        tag = "blockquote expandable" if (len(escaped_text) > 120 or "\n" in escaped_text) else "blockquote"
-        return f"<{tag}>{escaped_text}</{tag.split()[0]}>\n\n{footer}"
+        return f"{escaped_text}\n\n{footer}"
     else:
         return footer
 
