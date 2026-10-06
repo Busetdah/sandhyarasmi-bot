@@ -2758,8 +2758,6 @@ async def prompt_large_video_audio_fallback(
             InlineKeyboardButton("❌ Batal", callback_data=f"dl_cancel:{token}"),
         ]
     ]
-    if url.startswith("http://") or url.startswith("https://"):
-        keyboard.append([InlineKeyboardButton("🌐 Tonton Video Asli", url=url)])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
