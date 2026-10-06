@@ -321,9 +321,9 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
     except Exception as e:
-        log.warning("Failed to purge stale threads/tiktok cache: %s", e)
+        log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     conn.commit()
     return conn
 
@@ -678,27 +678,72 @@ def clean_metadata_fields(info: dict, url: str) -> tuple[str, str]:
 def format_caption(info: dict, url: str) -> str:
     main_text, clean_uploader = clean_metadata_fields(info, url)
 
-    if info.get("_kind") == "text" and info.get("title") and info.get("description") and info["title"].lower() not in info["description"].lower():
-        main_text = f"<b>{html.escape(info['title'])}</b>\n\n{html.escape(info['description'])}"
-    else:
-        main_text = html.escape(main_text)
+    is_text_only = (info.get("_kind") == "text")
 
-    max_len = 850
-    if len(main_text) > max_len:
-        main_text = main_text[:max_len].rsplit(" ", 1)[0] + "..."
+    # Determine raw caption text before HTML escaping
+    has_custom_title = (
+        is_text_only
+        and info.get("title")
+        and info.get("description")
+        and info["title"].lower() not in info["description"].lower()
+    )
+
+    if has_custom_title:
+        title_str = (info.get("title") or "").strip()
+        desc_str = (info.get("description") or "").strip()
+        raw_text = f"{title_str}\n\n{desc_str}" if title_str and desc_str else (desc_str or title_str)
+    else:
+        raw_text = main_text
+
+    platform = detect_platform_name(url)
+    escaped_url = html.escape(url)
+
+    # Calculate exact Telegram character budget based on UTF-16 code units:
+    # Telegram Hard Limits:
+    # - Media captions (photo, video, animation, media group): 1024 UTF-16 code units (parsed plain text).
+    # - Text messages (sendMessage, editMessageText): 4096 UTF-16 code units.
+    if is_text_only:
+        footer_plain = f"— @{clean_uploader}" if clean_uploader else ""
+        footer_len = len(footer_plain.encode("utf-16-le")) // 2 + (2 if footer_plain else 0)
+        max_budget = max(100, 4000 - footer_len)
+    else:
+        footer_parts = []
+        if clean_uploader:
+            footer_parts.append(f"by {clean_uploader}")
+        footer_parts.append(f"via {platform}")
+        footer_plain = " ".join(footer_parts)
+        footer_len = len(footer_plain.encode("utf-16-le")) // 2 + 2  # +2 for \n\n
+        max_budget = max(100, 1020 - footer_len)
+
+    # Safely truncate raw text at word boundary BEFORE HTML escaping ONLY if it truly exceeds Telegram's limit
+    text_utf16_len = len(raw_text.encode("utf-16-le")) // 2
+    if text_utf16_len > max_budget:
+        target_len = max(0, max_budget - 3)
+        truncated = raw_text
+        while len(truncated.encode("utf-16-le")) // 2 > target_len and truncated:
+            truncated = truncated[:-1]
+        if " " in truncated:
+            truncated = truncated.rsplit(" ", 1)[0]
+        raw_text = truncated.rstrip() + "..."
+
+    # Escape HTML entities after truncation
+    if has_custom_title:
+        if raw_text.endswith("..."):
+            escaped_text = html.escape(raw_text)
+        else:
+            escaped_text = f"<b>{html.escape(info['title'])}</b>\n\n{html.escape(info['description'])}"
+    else:
+        escaped_text = html.escape(raw_text)
 
     # For text-only posts (no media attached), strictly output clean text blockquote with author attribution.
     # Strictly DO NOT include any hyperlinks or URLs to prevent Telegram from generating a rich link preview header with avatar.
-    if info.get("_kind") == "text":
-        tag = "blockquote expandable" if (len(main_text) > 120 or "\n" in main_text) else "blockquote"
-        out = f"<{tag}>{main_text}</{tag.split()[0]}>" if main_text else ""
+    if is_text_only:
+        tag = "blockquote expandable" if (len(escaped_text) > 120 or "\n" in escaped_text) else "blockquote"
+        out = f"<{tag}>{escaped_text}</{tag.split()[0]}>" if escaped_text else ""
         if clean_uploader:
             author_line = f"— @{html.escape(clean_uploader)}"
             out = f"{out}\n\n{author_line}" if out else author_line
         return out
-
-    platform = detect_platform_name(url)
-    escaped_url = html.escape(url)
 
     footer_parts = []
     if clean_uploader:
@@ -706,9 +751,9 @@ def format_caption(info: dict, url: str) -> str:
     footer_parts.append(f'via <a href="{escaped_url}">{platform}</a>')
     footer = " ".join(footer_parts)
 
-    if main_text:
-        tag = "blockquote expandable" if (len(main_text) > 120 or "\n" in main_text) else "blockquote"
-        return f"<{tag}>{main_text}</{tag.split()[0]}>\n\n{footer}"
+    if escaped_text:
+        tag = "blockquote expandable" if (len(escaped_text) > 120 or "\n" in escaped_text) else "blockquote"
+        return f"<{tag}>{escaped_text}</{tag.split()[0]}>\n\n{footer}"
     else:
         return footer
 
