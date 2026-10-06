@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+data/
+temp/
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.db-*
+*.log
+cookies.txt
