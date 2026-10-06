@@ -1015,20 +1015,183 @@ def extract_instagram(url: str) -> dict | None:
     return None
 
 
+def extract_threads_embed(shortcode: str) -> dict | None:
+    """Extract complete Threads carousel/video/post data from Threads public embed HTML."""
+    try:
+        embed_url = f"https://www.threads.net/t/{shortcode}/embed/"
+        log.info("Querying Threads embed page: %s", embed_url)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        resp = HTTP_SESSION.get(embed_url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return None
+
+        embed_html = resp.text
+
+        # 1. Author
+        uploader = ""
+        m_user = re.search(r'href="https?://(?:www\.)?threads\.(?:net|com)/(?:&#064;|@)([\w.]+)', embed_html)
+        if m_user:
+            uploader = f"@{m_user.group(1)}"
+        else:
+            m_user2 = re.search(r'<div class="AuthorIdentity">.*?<a[^>]*class="HeaderLink"[^>]*><span>([^<]+)</span>', embed_html, re.DOTALL)
+            if m_user2:
+                uploader = f"@{m_user2.group(1).strip()}"
+
+        # 2. Caption
+        caption = ""
+        m_cap = re.search(r'<span class="BodyTextContainer"><span>(.*?)</span></span>', embed_html, re.DOTALL)
+        if not m_cap:
+            m_cap = re.search(r'<span class="TextContentContainer[^"]*">(?:<span[^>]*>)?(.*?)(?:</span>)?</span>', embed_html, re.DOTALL)
+        if m_cap:
+            raw_cap = re.sub(r'<[^>]+>', ' ', m_cap.group(1))
+            caption = html.unescape(raw_cap).strip()
+
+        # 3. Media Items
+        soup_embed = BeautifulSoup(embed_html, "html.parser")
+        media_items = []
+        seen_urls = set()
+
+        # A. Video elements
+        for v in soup_embed.find_all("video"):
+            src = v.get("src")
+            if not src:
+                src_tag = v.find("source")
+                if src_tag:
+                    src = src_tag.get("src")
+            if src:
+                clean_src = html.unescape(src).replace("&amp;", "&")
+                if not any(k in clean_src for k in ["/rsrc.php", "static."]):
+                    if clean_src not in seen_urls:
+                        seen_urls.add(clean_src)
+                        media_items.append({"url": clean_src, "kind": "video"})
+
+        # Video in scripts / raw mp4 if no video tag found
+        if not media_items:
+            for m in re.finditer(r'"video_versions":\s*(\[[^\]]+\])', embed_html):
+                try:
+                    v_list = json.loads(m.group(1))
+                    if v_list and isinstance(v_list, list) and v_list[0].get("url"):
+                        u_cand = v_list[0]["url"]
+                        if not any(k in u_cand for k in ["/rsrc.php", "static."]):
+                            if u_cand not in seen_urls:
+                                seen_urls.add(u_cand)
+                                media_items.append({"url": u_cand, "kind": "video"})
+                                break
+                except Exception:
+                    pass
+
+        if not media_items:
+            raw_vids = re.findall(r'https:(?:\\/\\/|//)[^"\'\s<>]*(?:\.mp4|\/o1\/v\/t16)[^"\'\s<>]*', embed_html)
+            for raw_v in raw_vids:
+                clean_v = raw_v.replace(r'\/', '/').replace(r'\u0026', '&')
+                if not any(k in clean_v for k in ["/rsrc.php", "static."]):
+                    if clean_v not in seen_urls:
+                        seen_urls.add(clean_v)
+                        media_items.append({"url": clean_v, "kind": "video"})
+                        break
+
+        # B. Image elements (preserve sequential carousel order)
+        for img in soup_embed.find_all("img"):
+            src = img.get("src")
+            if not src:
+                continue
+            clean_src = html.unescape(src).replace("&amp;", "&")
+            if any(k in clean_src for k in [
+                "/rsrc.php", "static.", "profile_pic", "s100x100", "s150x150",
+                "s50x50", "t39.92108-6", "avatar"
+            ]):
+                continue
+
+            # Check if parent belongs to AvatarContainer
+            is_avatar = False
+            p = img.parent
+            while p and p.name != "body":
+                classes = p.get("class") or []
+                if any("Avatar" in cls for cls in classes):
+                    is_avatar = True
+                    break
+                p = p.parent
+            if is_avatar:
+                continue
+
+            if clean_src not in seen_urls:
+                seen_urls.add(clean_src)
+                media_items.append({"url": clean_src, "kind": "photo"})
+
+        if len(media_items) > 1:
+            log.info("Threads embed parsed %d carousel items for %s", len(media_items), shortcode)
+            return {
+                "_kind": "album",
+                "items": media_items,
+                "title": caption,
+                "description": caption,
+                "uploader": uploader,
+            }
+        elif len(media_items) == 1:
+            first = media_items[0]
+            log.info("Threads embed parsed single %s for %s", first["kind"], shortcode)
+            return {
+                "formats": [],
+                "url": first["url"],
+                "ext": "mp4" if first["kind"] == "video" else "jpg",
+                "filesize": None,
+                "title": caption,
+                "description": caption,
+                "uploader": uploader,
+                "_kind": first["kind"],
+            }
+        elif caption:
+            log.info("Threads embed parsed text-only post for %s", shortcode)
+            return {
+                "_kind": "text",
+                "title": caption,
+                "description": caption,
+                "uploader": uploader,
+            }
+    except Exception as e:
+        log.warning("extract_threads_embed failed for shortcode %s: %s", shortcode, e)
+
+    return None
+
+
 def extract_threads(url: str) -> dict | None:
     """Extract real attached media (MP4 video, photo, album) and caption from Threads posts."""
     try:
         # 1. Resolve share / short links to canonical post URL
         target_url = url
-        if "/share/" in url or "/t/" in url:
-            try:
-                r_head = HTTP_SESSION.get(url, headers={"User-Agent": "facebookexternalhit/1.1"}, allow_redirects=True, timeout=10)
-                if r_head.status_code == 200 and "/post/" in r_head.url:
-                    target_url = r_head.url
-            except Exception:
-                pass
+        shortcode = None
 
-        # 2. Fetch canonical post with browser navigation headers
+        m_sc = re.search(r"/(?:post|t)/([A-Za-z0-9_-]+)", url)
+        if m_sc:
+            shortcode = m_sc.group(1)
+
+        if not shortcode or "/share/" in url:
+            try:
+                r_head = HTTP_SESSION.get(
+                    url,
+                    headers={"User-Agent": "facebookexternalhit/1.1"},
+                    allow_redirects=True,
+                    timeout=10,
+                )
+                if r_head.status_code == 200:
+                    target_url = r_head.url
+                    m_sc2 = re.search(r"/(?:post|t)/([A-Za-z0-9_-]+)", target_url)
+                    if m_sc2:
+                        shortcode = m_sc2.group(1)
+            except Exception as e:
+                log.debug("Threads resolve redirect error: %s", e)
+
+        # 2. Try Public Embed (Fast, zero cookies, full carousel album support)
+        if shortcode:
+            embed_data = extract_threads_embed(shortcode)
+            if embed_data:
+                return embed_data
+
+        # 3. Fallback: Fetch canonical post with browser navigation headers
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1094,10 +1257,10 @@ def extract_threads(url: str) -> dict | None:
                     video_url = clean_v
                     break
 
-        # 1. Video Result
+        # Video Result
         if video_url:
             clean_video_url = video_url.replace(r'\/', '/').replace(r'\u0026', '&').replace('&amp;', '&')
-            log.info("Threads video successfully extracted: %s", clean_video_url[:80])
+            log.info("Threads video successfully extracted via canonical page: %s", clean_video_url[:80])
             return {
                 "formats": [],
                 "url": clean_video_url,
@@ -1109,10 +1272,10 @@ def extract_threads(url: str) -> dict | None:
                 "_kind": "video",
             }
 
-        # 2. Raw Attached Image(s)
+        # Raw Attached Image(s)
         if og_image:
             clean_image_url = og_image.replace(r'\/', '/').replace(r'\u0026', '&').replace('&amp;', '&')
-            log.info("Threads single real photo found: %s", clean_image_url[:80])
+            log.info("Threads photo found via canonical page: %s", clean_image_url[:80])
             return {
                 "formats": [],
                 "url": clean_image_url,
@@ -1124,7 +1287,7 @@ def extract_threads(url: str) -> dict | None:
                 "_kind": "photo",
             }
 
-        # 3. Text-only fallback
+        # Text-only fallback
         if og_title or og_desc:
             return {
                 "_kind": "text",
