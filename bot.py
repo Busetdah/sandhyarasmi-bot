@@ -1103,6 +1103,20 @@ def is_avatar_url(u: str) -> bool:
     return False
 
 
+def is_threads_generic_card(url: str, width: str = "", height: str = "") -> bool:
+    """Identify Threads auto-generated share preview card (1200x628 / t39.* fbcdn) to avoid treating it as attached photo."""
+    if not url:
+        return False
+    u_lower = url.lower()
+    if any(k in u_lower for k in ["t39.92108-6", "t39.30808-6", "barcelona_share", "share_sheet", "og_image_template"]):
+        return True
+    if "fbcdn.net" in u_lower and "/t39." in u_lower:
+        return True
+    if str(width) == "1200" and str(height) == "628":
+        return True
+    return False
+
+
 def extract_threads_embed(shortcode: str) -> dict | None:
     """Extract complete Threads carousel/video/post data from Threads public embed HTML."""
     try:
@@ -1110,11 +1124,13 @@ def extract_threads_embed(shortcode: str) -> dict | None:
         log.info("Querying Threads embed page: %s", embed_url)
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
         }
-        resp = HTTP_SESSION.get(embed_url, headers=headers, timeout=10)
+        resp = HTTP_SESSION.get(embed_url, headers=headers, timeout=15)
         if resp.status_code != 200:
+            log.warning("Threads embed returned status %d for %s", resp.status_code, shortcode)
             return None
 
         embed_html = resp.text
@@ -1149,7 +1165,7 @@ def extract_threads_embed(shortcode: str) -> dict | None:
         media_items = []
         seen_urls = set()
 
-        # A. Video elements
+        # A. Video elements (only real video in the post)
         for v in soup_embed.find_all("video"):
             src = v.get("src")
             if not src:
@@ -1163,7 +1179,7 @@ def extract_threads_embed(shortcode: str) -> dict | None:
                         seen_urls.add(clean_src)
                         media_items.append({"url": clean_src, "kind": "video"})
 
-        # Video in scripts / raw mp4 if no video tag found
+        # Video in scripts if directly provided for this post
         if not media_items:
             for m in re.finditer(r'"video_versions":\s*(\[[^\]]+\])', embed_html):
                 try:
@@ -1178,24 +1194,13 @@ def extract_threads_embed(shortcode: str) -> dict | None:
                 except Exception:
                     pass
 
-        if not media_items:
-            raw_vids = re.findall(r'https:(?:\\/\\/|//)[^"\'\s<>\\]*(?:\.mp4|\/o1\/v\/t16)[^"\'\s<>\\]*', embed_html)
-            for raw_v in raw_vids:
-                clean_v = raw_v.replace(r'\/', '/').replace(r'\u0026', '&')
-                if not any(k in clean_v.lower() for k in ["/rsrc.php", "static.", "dash_audio", "audio_aac", "_audio"]):
-                    clean_v = re.split(r'[\s<"\'\\]', clean_v)[0]
-                    if clean_v not in seen_urls:
-                        seen_urls.add(clean_v)
-                        media_items.append({"url": clean_v, "kind": "video"})
-                        break
-
-        # B. Image elements (preserve sequential carousel order, ignore avatars)
+        # B. Image elements (preserve sequential carousel order, ignore avatars & link preview icons)
         for img in soup_embed.find_all("img"):
             src = img.get("src")
             if not src:
                 continue
             clean_src = html.unescape(src).replace("&amp;", "&")
-            if is_avatar_url(clean_src):
+            if is_avatar_url(clean_src) or is_threads_generic_card(clean_src):
                 continue
 
             # Check if image or parent belongs to avatar/profile/identity container
@@ -1209,11 +1214,15 @@ def extract_threads_embed(shortcode: str) -> dict | None:
             p = img.parent
             while p and p.name not in ("body", "[document]"):
                 p_cls = " ".join(p.get("class", [])) if isinstance(p.get("class"), list) else str(p.get("class") or "")
-                if any(k in p_cls.lower() for k in ["avatar", "profile", "authoridentity", "author"]):
+                if any(k in p_cls.lower() for k in ["avatar", "profile", "authoridentity", "author", "linkattachment"]):
                     is_avatar = True
                     break
                 p = p.parent
             if is_avatar:
+                continue
+
+            # Skip Facebook/Instagram static bundles, favicons, webp UI icons
+            if any(k in clean_src.lower() for k in ["/rsrc.php", "static.", "favicon", ".webp"]):
                 continue
 
             if clean_src not in seen_urls:
@@ -1271,7 +1280,7 @@ def extract_threads(url: str) -> dict | None:
             try:
                 r_head = HTTP_SESSION.get(
                     url,
-                    headers={"User-Agent": "facebookexternalhit/1.1"},
+                    headers={"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"},
                     allow_redirects=True,
                     timeout=15,
                 )
@@ -1297,15 +1306,11 @@ def extract_threads(url: str) -> dict | None:
             if embed_data:
                 return embed_data
 
-        # 3. Fallback: Fetch canonical post with browser navigation headers
+        # 3. Fallback: Fetch canonical post with crawler headers
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-User": "?1",
-            "Sec-Fetch-Dest": "document",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
         }
         resp = HTTP_SESSION.get(target_url, headers=headers, allow_redirects=True, timeout=EXTRACT_TIMEOUT)
         if resp.status_code != 200:
@@ -1317,6 +1322,8 @@ def extract_threads(url: str) -> dict | None:
         og_desc = ""
         og_image = ""
         og_video = ""
+        og_image_w = ""
+        og_image_h = ""
 
         for m in soup.find_all("meta"):
             prop = m.get("property") or m.get("name")
@@ -1328,10 +1335,13 @@ def extract_threads(url: str) -> dict | None:
             elif prop in ["og:description", "twitter:description", "description"] and not og_desc:
                 og_desc = content
             elif prop in ["og:image", "twitter:image"] and not og_image:
-                if not is_avatar_url(content):
-                    og_image = content
+                og_image = content
+            elif prop in ["og:image:width", "twitter:image:width"] and not og_image_w:
+                og_image_w = content
+            elif prop in ["og:image:height", "twitter:image:height"] and not og_image_h:
+                og_image_h = content
             elif prop in ["og:video", "og:video:secure_url", "twitter:player"] and not og_video:
-                if not any(k in content for k in ["/rsrc.php", "static."]):
+                if not any(k in content for k in ["/rsrc.php", "static.", "dash_audio"]):
                     og_video = content
 
         uploader = ""
@@ -1340,28 +1350,12 @@ def extract_threads(url: str) -> dict | None:
             uploader = m_user.group(1)
         caption = og_desc or og_title
 
-        # A. Check for Video in Meta or Script tags (handles escaped https:\/\/...mp4)
-        video_url = og_video
-        if not video_url:
-            for m in re.finditer(r'"video_versions":\s*(\[[^\]]+\])', html_text):
-                try:
-                    v_list = json.loads(m.group(1))
-                    if v_list and isinstance(v_list, list) and v_list[0].get("url"):
-                        u_cand = v_list[0]["url"]
-                        if not any(k in u_cand.lower() for k in ["/rsrc.php", "static.", "dash_audio", "audio_aac", "_audio"]):
-                            video_url = u_cand
-                            break
-                except Exception:
-                    pass
+        # Discard generic cards and avatars
+        if og_image and (is_avatar_url(og_image) or is_threads_generic_card(og_image, og_image_w, og_image_h)):
+            og_image = ""
 
-        if not video_url:
-            raw_video_matches = re.findall(r'https:(?:\\/\\/|//)[^"\'\s<>\\]*(?:\.mp4|\/o1\/v\/t16)[^"\'\s<>\\]*', html_text)
-            for raw_v in raw_video_matches:
-                clean_v = raw_v.replace(r'\/', '/').replace(r'\u0026', '&')
-                if not any(k in clean_v.lower() for k in ["/rsrc.php", "static.", "dash_audio", "audio_aac", "_audio"]):
-                    clean_v = re.split(r'[\s<"\'\\]', clean_v)[0]
-                    video_url = clean_v
-                    break
+        # Strictly check for direct post video (avoid greedy regex that matches recommended reels)
+        video_url = og_video
 
         # Video Result
         if video_url:
@@ -1378,7 +1372,7 @@ def extract_threads(url: str) -> dict | None:
                 "_kind": "video",
             }
 
-        # Raw Attached Image(s) - avatars strictly excluded
+        # Raw Attached Image(s) - avatars and generic cards strictly excluded
         if og_image:
             clean_image_url = og_image.replace(r'\/', '/').replace(r'\u0026', '&').replace('&amp;', '&')
             log.info("Threads photo found via canonical page: %s", clean_image_url[:80])
@@ -1443,6 +1437,7 @@ def og_scrape_fallback(url: str) -> dict | None:
     if image_url and (
         any(k in image_url for k in ["redditstatic.com", "share.redd.it/preview", "play-icon", "photomode-share-video"])
         or is_avatar_url(image_url)
+        or is_threads_generic_card(image_url)
         or any(k in url.lower() for k in ["tiktok.com", "vt.tiktok.com", "vm.tiktok.com"])
     ):
         image_url = None
