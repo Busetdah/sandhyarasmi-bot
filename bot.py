@@ -70,6 +70,28 @@ MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
 EXTRACT_TIMEOUT = int(os.environ.get("EXTRACT_TIMEOUT", 30))
 COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 0.0))
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
+ROUTER_API_URL = os.environ.get("ROUTER_API_URL", "https://router.azrim.my.id/v1/chat/completions")
+ROUTER_API_KEY = (
+    os.environ.get("ROUTER_API_KEY", "")
+    or os.environ.get("ROUTER_TOKEN", "")
+    or os.environ.get("NINEROUTER_API_KEY", "")
+    or os.environ.get("NINEROUTER_TOKEN", "")
+    or ""
+).strip()
+ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "cbcn/deepseek-v4.1-flash(xhigh)").strip()
+
+
+def get_clean_router_url(raw_url: str) -> str:
+    url = (raw_url or "https://router.azrim.my.id/v1/chat/completions").strip().rstrip("/")
+    if url.endswith("/dashboard"):
+        url = url[:-10].rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    if url.endswith("/v1"):
+        return f"{url}/chat/completions"
+    return f"{url}/v1/chat/completions"
+
+
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://172.17.0.1:18080/v1/chat/completions")
 HCNSEC_API_URL = os.environ.get("HCNSEC_API_URL", "https://api.hcnsec.cn/v1/chat/completions")
 HCNSEC_API_KEY = os.environ.get("HCNSEC_API_KEY", "")
@@ -1867,13 +1889,15 @@ def get_caller_identity_info(user) -> tuple[str, str]:
 
 
 KNOWN_USERNAMES_REGEX = re.compile(r'@(ThisIsTag|titidlancip|azrim89|nawocci|irawansalt|harumajati|mikaziku|benaXy|misterdon19)\b', re.IGNORECASE)
-LEAK_PATTERNS = re.compile(r'(Dual EPYC|EPYC 9654|1\.5TB RAM|8x H100|30TB NVMe|HCNSEC_API_KEY|build_system_prompt|LARANGAN KONTEN|ATURAN NAMA|MEMBERS\.md)', re.IGNORECASE)
+LEAK_PATTERNS = re.compile(r'(Dual EPYC|EPYC 9654|1\.5TB RAM|8x H100|30TB NVMe|ROUTER_API_KEY|HCNSEC_API_KEY|build_system_prompt|LARANGAN KONTEN|ATURAN NAMA|MEMBERS\.md)', re.IGNORECASE)
 
 
 def sanitize_ai_reply(text: str) -> str:
-    """Strip active @mentions of group members and prevent prompt leakage."""
+    """Strip active @mentions of group members, remove reasoning <think> blocks, and prevent prompt leakage."""
     if not text:
         return text
+    # Strip DeepSeek / R1 reasoning <think>...</think> blocks
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
     if LEAK_PATTERNS.search(text):
         return "Rahasia dapur, Bos! Gak boleh diintip wkwk 😜"
     return KNOWN_USERNAMES_REGEX.sub(r'\1', text)
@@ -1939,28 +1963,71 @@ async def send_typing_loop(bot, chat_id: int, stop_event: asyncio.Event):
 
 
 def call_ai_api(payload: dict) -> str | None:
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {HCNSEC_API_KEY}"
-    }
-    models_to_try = [HCNSEC_MODEL, "kat-coder-pro-v2.5", "MiniMax-M3", "step-3.7-flash", "glm-5.2", "Qwen3.6-27B"]
-    seen = set()
-    models_ordered = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-    for model_name in models_ordered:
+    # 1. Primary: 9router (https://router.azrim.my.id)
+    if ROUTER_API_KEY:
+        router_endpoint = get_clean_router_url(ROUTER_API_URL)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ROUTER_API_KEY}",
+        }
         try:
             p = dict(payload)
-            p["model"] = model_name
-            r = HTTP_SESSION.post(HCNSEC_API_URL, headers=headers, json=p, timeout=20)
+            p["model"] = ROUTER_MODEL
+            r = HTTP_SESSION.post(router_endpoint, headers=headers, json=p, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                choices = data.get("choices", [])
+                if choices and isinstance(choices, list) and len(choices) > 0:
+                    msg = choices[0].get("message", {})
+                    content = msg.get("content") or ""
+                    if not content and msg.get("reasoning_content"):
+                        content = msg.get("reasoning_content")
+                    if not content and "text" in choices[0]:
+                        content = choices[0].get("text", "")
+                    if content and str(content).strip():
+                        return str(content).strip()
+            else:
+                log.warning("9router HTTP %s with model %s: %s", r.status_code, ROUTER_MODEL, r.text[:200])
+        except Exception as e:
+            log.warning("9router exception with model %s: %s", ROUTER_MODEL, e)
+
+    # 2. Fallback: HCNSEC API
+    if HCNSEC_API_KEY:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {HCNSEC_API_KEY}",
+        }
+        models_to_try = [HCNSEC_MODEL, "kat-coder-pro-v2.5", "MiniMax-M3", "step-3.7-flash", "glm-5.2", "Qwen3.6-27B"]
+        seen = set()
+        models_ordered = [m for m in models_to_try if not (m in seen or seen.add(m))]
+
+        for model_name in models_ordered:
+            try:
+                p = dict(payload)
+                p["model"] = model_name
+                r = HTTP_SESSION.post(HCNSEC_API_URL, headers=headers, json=p, timeout=20)
+                if r.status_code == 200:
+                    data = r.json()
+                    content = data["choices"][0]["message"].get("content", "")
+                    if content and content.strip():
+                        return content.strip()
+                else:
+                    log.warning("HCNSEC HTTP %s with model %s: %s", r.status_code, model_name, r.text[:100])
+            except Exception as e:
+                log.warning("HCNSEC exception with model %s: %s", model_name, e)
+
+    # 3. Fallback: Local Llama Server
+    if LLAMA_SERVER_URL:
+        try:
+            p = dict(payload)
+            r = HTTP_SESSION.post(LLAMA_SERVER_URL, json=p, timeout=20)
             if r.status_code == 200:
                 data = r.json()
                 content = data["choices"][0]["message"].get("content", "")
                 if content and content.strip():
                     return content.strip()
-            else:
-                log.warning("AI API HTTP %s with model %s: %s", r.status_code, model_name, r.text[:100])
         except Exception as e:
-            log.warning("AI API exception with model %s: %s", model_name, e)
+            log.debug("Local LLAMA exception: %s", e)
 
     return None
 
@@ -2476,6 +2543,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     all_urls = URL_REGEX.findall(text)
     if not all_urls:
+        # Chatbot handler: trigger if bot is tagged/mentioned or replied to in group
+        bot_info = context.bot
+        bot_username = (bot_info.username or "").lower()
+        is_reply_to_bot = bool(
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == bot_info.id
+        )
+        is_bot_mentioned = bool(bot_username and f"@{bot_username}" in text.lower()) or is_reply_to_bot
+
+        if is_bot_mentioned and text and not text.startswith("/"):
+            clean_query = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE).strip() if bot_username else text
+            if not clean_query and message.reply_to_message:
+                clean_query = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+            if clean_query:
+                user_id = user.id if user else 0
+                now = time.time()
+                last_ai_seen = USER_AI_LAST_SEEN.get(user_id, 0.0)
+                if (now - last_ai_seen) < 3.0:
+                    log.info("AI Rate limit active for user %s (%s). Cooldown: %.1fs left", user_info, user_id, 3.0 - (now - last_ai_seen))
+                    return
+                USER_AI_LAST_SEEN[user_id] = now
+
+                stop_event = asyncio.Event()
+                typing_task = asyncio.create_task(send_typing_loop(context.bot, message.chat_id, stop_event))
+                try:
+                    caller_name, caller_context = get_caller_identity_info(user)
+                    system_prompt = build_system_prompt_for_user(user, base_role="tanya")
+                    user_message_content = f"IDENTITAS PENANYA:\n{caller_context}\n\nPERTANYAAN DARI {caller_name.upper()}:\n{clean_query}"
+                    payload = {
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_message_content},
+                        ],
+                        "temperature": 0.5,
+                        "max_tokens": 800,
+                    }
+                    reply_content = await asyncio.to_thread(call_ai_api, payload)
+                    if reply_content:
+                        cleaned_reply = sanitize_ai_reply(reply_content.strip())
+                        log.info("🤖 [AI BALAS MENTION ke %s]: %s", user_info, cleaned_reply.replace('\n', ' ')[:150])
+                        try:
+                            await message.reply_text(cleaned_reply, parse_mode=ParseMode.MARKDOWN)
+                        except Exception:
+                            await message.reply_text(cleaned_reply)
+                except Exception as e_ai:
+                    log.warning("Error responding to mention: %s", e_ai)
+                finally:
+                    stop_event.set()
+                    await typing_task
         return
 
     urls = [u for u in all_urls if looks_supported(u)]
