@@ -1015,6 +1015,21 @@ def extract_instagram(url: str) -> dict | None:
     return None
 
 
+def is_avatar_url(u: str) -> bool:
+    """Detect if a media URL points to an avatar / profile picture or UI template."""
+    if not u:
+        return True
+    u_lower = u.lower()
+    if any(k in u_lower for k in [
+        "/rsrc.php", "static.", "profile_pic", "avatar",
+        "-19/", "t51.82787-19", "t51.2885-19", "t39.92108-6"
+    ]):
+        return True
+    if re.search(r"s\d+x\d+", u_lower):  # e.g. s100x100, s150x150, s320x320, s640x640
+        return True
+    return False
+
+
 def extract_threads_embed(shortcode: str) -> dict | None:
     """Extract complete Threads carousel/video/post data from Threads public embed HTML."""
     try:
@@ -1030,6 +1045,7 @@ def extract_threads_embed(shortcode: str) -> dict | None:
             return None
 
         embed_html = resp.text
+        soup_embed = BeautifulSoup(embed_html, "html.parser")
 
         # 1. Author
         uploader = ""
@@ -1043,15 +1059,20 @@ def extract_threads_embed(shortcode: str) -> dict | None:
 
         # 2. Caption
         caption = ""
-        m_cap = re.search(r'<span class="BodyTextContainer"><span>(.*?)</span></span>', embed_html, re.DOTALL)
-        if not m_cap:
-            m_cap = re.search(r'<span class="TextContentContainer[^"]*">(?:<span[^>]*>)?(.*?)(?:</span>)?</span>', embed_html, re.DOTALL)
-        if m_cap:
-            raw_cap = re.sub(r'<[^>]+>', ' ', m_cap.group(1))
-            caption = html.unescape(raw_cap).strip()
+        body_span = soup_embed.find("span", class_="BodyTextContainer")
+        if body_span:
+            caption = body_span.get_text("\n").strip()
+        if not caption:
+            text_container = soup_embed.find("span", class_="TextContentContainer")
+            if text_container:
+                caption = text_container.get_text("\n").strip()
+        if not caption:
+            m_cap = re.search(r'<span class="BodyTextContainer"><span>(.*?)</span></span>', embed_html, re.DOTALL)
+            if m_cap:
+                raw_cap = re.sub(r'<[^>]+>', ' ', m_cap.group(1))
+                caption = html.unescape(raw_cap).strip()
 
         # 3. Media Items
-        soup_embed = BeautifulSoup(embed_html, "html.parser")
         media_items = []
         seen_urls = set()
 
@@ -1064,7 +1085,7 @@ def extract_threads_embed(shortcode: str) -> dict | None:
                     src = src_tag.get("src")
             if src:
                 clean_src = html.unescape(src).replace("&amp;", "&")
-                if not any(k in clean_src for k in ["/rsrc.php", "static."]):
+                if not any(k in clean_src.lower() for k in ["/rsrc.php", "static.", "dash_audio", "audio_aac", "_audio"]):
                     if clean_src not in seen_urls:
                         seen_urls.add(clean_src)
                         media_items.append({"url": clean_src, "kind": "video"})
@@ -1076,7 +1097,7 @@ def extract_threads_embed(shortcode: str) -> dict | None:
                     v_list = json.loads(m.group(1))
                     if v_list and isinstance(v_list, list) and v_list[0].get("url"):
                         u_cand = v_list[0]["url"]
-                        if not any(k in u_cand for k in ["/rsrc.php", "static."]):
+                        if not any(k in u_cand.lower() for k in ["/rsrc.php", "static.", "dash_audio", "audio_aac", "_audio"]):
                             if u_cand not in seen_urls:
                                 seen_urls.add(u_cand)
                                 media_items.append({"url": u_cand, "kind": "video"})
@@ -1085,25 +1106,23 @@ def extract_threads_embed(shortcode: str) -> dict | None:
                     pass
 
         if not media_items:
-            raw_vids = re.findall(r'https:(?:\\/\\/|//)[^"\'\s<>]*(?:\.mp4|\/o1\/v\/t16)[^"\'\s<>]*', embed_html)
+            raw_vids = re.findall(r'https:(?:\\/\\/|//)[^"\'\s<>\\]*(?:\.mp4|\/o1\/v\/t16)[^"\'\s<>\\]*', embed_html)
             for raw_v in raw_vids:
                 clean_v = raw_v.replace(r'\/', '/').replace(r'\u0026', '&')
-                if not any(k in clean_v for k in ["/rsrc.php", "static."]):
+                if not any(k in clean_v.lower() for k in ["/rsrc.php", "static.", "dash_audio", "audio_aac", "_audio"]):
+                    clean_v = re.split(r'[\s<"\'\\]', clean_v)[0]
                     if clean_v not in seen_urls:
                         seen_urls.add(clean_v)
                         media_items.append({"url": clean_v, "kind": "video"})
                         break
 
-        # B. Image elements (preserve sequential carousel order)
+        # B. Image elements (preserve sequential carousel order, ignore avatars)
         for img in soup_embed.find_all("img"):
             src = img.get("src")
             if not src:
                 continue
             clean_src = html.unescape(src).replace("&amp;", "&")
-            if any(k in clean_src for k in [
-                "/rsrc.php", "static.", "profile_pic", "s100x100", "s150x150",
-                "s50x50", "t39.92108-6", "avatar"
-            ]):
+            if is_avatar_url(clean_src):
                 continue
 
             # Check if parent belongs to AvatarContainer
@@ -1222,8 +1241,7 @@ def extract_threads(url: str) -> dict | None:
             elif prop in ["og:description", "twitter:description", "description"] and not og_desc:
                 og_desc = content
             elif prop in ["og:image", "twitter:image"] and not og_image:
-                # Ignore avatars, generic icons, and card templates (t39.92108-6)
-                if not any(k in content for k in ["/rsrc.php", "profile_pic", "s150x150", "s100x100", "s50x50", "t39.92108-6"]):
+                if not is_avatar_url(content):
                     og_image = content
             elif prop in ["og:video", "og:video:secure_url", "twitter:player"] and not og_video:
                 if not any(k in content for k in ["/rsrc.php", "static."]):
@@ -1273,7 +1291,7 @@ def extract_threads(url: str) -> dict | None:
                 "_kind": "video",
             }
 
-        # Raw Attached Image(s)
+        # Raw Attached Image(s) - avatars strictly excluded
         if og_image:
             clean_image_url = og_image.replace(r'\/', '/').replace(r'\u0026', '&').replace('&amp;', '&')
             log.info("Threads photo found via canonical page: %s", clean_image_url[:80])
@@ -1335,7 +1353,7 @@ def og_scrape_fallback(url: str) -> dict | None:
         if m:
             uploader = f"@{m.group(1)}"
 
-    if image_url and any(k in image_url for k in ["redditstatic.com", "share.redd.it/preview"]):
+    if image_url and (any(k in image_url for k in ["redditstatic.com", "share.redd.it/preview"]) or is_avatar_url(image_url)):
         image_url = None
 
     if video_url:
