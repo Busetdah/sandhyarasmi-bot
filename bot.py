@@ -1016,7 +1016,7 @@ def extract_instagram(url: str) -> dict | None:
 
 
 def extract_threads(url: str) -> dict | None:
-    """Extract real attached media (MP4 video, full HD photo, album) and caption from Threads posts."""
+    """Extract real attached media (MP4 video, photo, album) and caption from Threads posts."""
     try:
         # 1. Resolve share / short links to canonical post URL
         target_url = url
@@ -1373,7 +1373,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🎵 **TikTok** (`video`, `photo slide`)\n"
         "• 📸 **Instagram** (`reel`, `post`, `carousel`)\n"
         "• 🎥 **YouTube** (`shorts`, `video hingga 50MB`)\n"
-        "• 🤖 **Reddit** (`video HD`, `animasi GIF`, `gallery`, `post teks`)\n"
+        "• 🤖 **Reddit** (`video`, `animasi GIF`, `gallery`, `post teks`)\n"
         "• 🧵 **Threads** (`post`, `multi-images`)\n"
         "• 🐦 **X / Twitter** (`x.com`)\n"
         "• 📘 **Facebook** (`video`, `reels`)\n\n"
@@ -2062,7 +2062,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "• 🎵 **TikTok** (`video`, `photo slide`)\n"
             "• 📸 **Instagram** (`reel`, `post`, `carousel`)\n"
             "• 🎥 **YouTube** (`shorts`, `video hingga 50MB`)\n"
-            "• 🤖 **Reddit** (`video HD`, `animasi GIF`, `gallery`, `post teks`)\n"
+            "• 🤖 **Reddit** (`video`, `animasi GIF`, `gallery`, `post teks`)\n"
             "• 🧵 **Threads** (`post`, `multi-images`)\n"
             "• 🐦 **X / Twitter** (`x.com`)\n"
             "• 📘 **Facebook** (`video`, `reels`)\n\n"
@@ -2116,10 +2116,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "• `/tanya <soal/kode>` - Tanya instan, benerin error Python, rumus, dsb.\n"
             "• `/riset <topik>` - Riset mendalam (ambil 4 sumber internet & simpulkan).\n\n"
             "🚀 **Kirimkan Link Media di Grup**:\n"
-            "• **TikTok**: Video Full HD tanpa watermark & Photo Slides.\n"
-            "• **Reddit**: Video resolusi tinggi (9:16 utuh), GIF, gallery, post teks.\n"
+            "• **TikTok**: Video tanpa watermark & Photo Slides.\n"
+            "• **Reddit**: Video utuh, GIF, gallery, post teks.\n"
             "• **Instagram**: Video Reels + thumbnail/durasi, single/carousel foto.\n"
-            "• **Threads**: Postingan teks & album foto HD resolusi penuh.\n"
+            "• **Threads**: Postingan teks & album foto.\n"
             "• **X / Twitter**: Postingan video & foto instan.\n\n"
             "⌨️ **Perintah Bot Lainnya**:\n"
             "• `/start` - Menu utama & navigasi\n"
@@ -2275,7 +2275,7 @@ async def download_and_send_via_ytdlp(
     """Download video/audio directly using yt-dlp with best quality under 50MB and upload to Telegram."""
     if status_msg:
         try:
-            await status_msg.edit_text("⏳ Sedang mengunduh media resolusi tinggi...")
+            await status_msg.edit_text("⏳ Sedang mengunduh media...")
         except Exception:
             pass
 
