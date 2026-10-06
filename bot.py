@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import uuid
 from urllib.parse import quote
 
 import requests
@@ -2498,6 +2499,40 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ]
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
 
+    elif data.startswith("dl_mp3:"):
+        token = data.split(":", 1)[1]
+        session = PENDING_AUDIO_DOWNLOADS.pop(token, None)
+        if not session:
+            try:
+                await query.edit_message_text("⏳ Sesi konfirmasi sudah kedaluwarsa atau sudah diproses.", reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        try:
+            await query.edit_message_text("⏳ Sedang mengunduh dan mengekstrak audio MP3...", reply_markup=None)
+        except Exception:
+            pass
+
+        asyncio.create_task(
+            execute_pending_audio_download(
+                session=session,
+                bot=context.bot,
+                status_msg=query.message,
+            )
+        )
+
+    elif data.startswith("dl_cancel:"):
+        token = data.split(":", 1)[1]
+        PENDING_AUDIO_DOWNLOADS.pop(token, None)
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_text("❌ Pengunduhan dibatalkan.", reply_markup=None)
+            except Exception:
+                pass
+
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -2681,6 +2716,207 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_link(url, message, context)
 
 
+PENDING_AUDIO_DOWNLOADS: dict[str, dict] = {}
+
+
+async def prompt_large_video_audio_fallback(
+    url: str,
+    clean_target_url: str,
+    message,
+    caption: str,
+    status_msg=None,
+    info: dict | None = None,
+    detected_size_mb: float | None = None,
+) -> bool:
+    """Prompt user with interactive buttons when video exceeds 50MB asking if they want MP3 audio."""
+    now = time.time()
+    for k, v in list(PENDING_AUDIO_DOWNLOADS.items()):
+        if now - v.get("created_at", 0) > 1800:
+            PENDING_AUDIO_DOWNLOADS.pop(k, None)
+
+    token = uuid.uuid4().hex[:10]
+    PENDING_AUDIO_DOWNLOADS[token] = {
+        "url": url,
+        "clean_url": clean_target_url,
+        "chat_id": message.chat.id,
+        "orig_msg_id": message.message_id,
+        "caption": caption,
+        "info": info,
+        "created_at": now,
+    }
+
+    size_str = f" (~{int(detected_size_mb)} MB)" if detected_size_mb else ""
+    confirm_text = (
+        f"⚠️ <b>Video melebihi 50 MB{size_str}</b>\n\n"
+        "Bot tidak dapat mengunggah video lebih dari <b>50 MB</b> karena ketentuan batas ukuran file dari Telegram.\n\n"
+        "Apakah Anda ingin mengunduh versi <b>audio (MP3)</b> saja?"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🎵 Ya, Kirim MP3", callback_data=f"dl_mp3:{token}"),
+            InlineKeyboardButton("❌ Batal", callback_data=f"dl_cancel:{token}"),
+        ]
+    ]
+    if url.startswith("http://") or url.startswith("https://"):
+        keyboard.append([InlineKeyboardButton("🌐 Tonton Video Asli", url=url)])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if status_msg:
+        try:
+            await status_msg.edit_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            return True
+        except Exception as e:
+            log.warning("Could not edit status_msg for large video prompt: %s", e)
+
+    try:
+        await message.reply_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except Exception as e:
+        log.warning("Could not send large video prompt: %s", e)
+    return True
+
+
+async def execute_pending_audio_download(session: dict, bot, status_msg=None):
+    """Execute audio extraction and send to chat after user clicks MP3 confirmation button."""
+    url = session["url"]
+    clean_target_url = session["clean_url"]
+    chat_id = session["chat_id"]
+    orig_msg_id = session.get("orig_msg_id")
+    caption = session.get("caption") or ""
+    info = session.get("info")
+
+    temp_id = int(time.time() * 1000)
+    temp_dir = os.environ.get("TEMP_DIR", "/app/temp")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    dur = (info.get("duration") if info else None)
+    if dur and dur > 3600:
+        audio_quality = "64K"
+    elif dur and dur > 1800:
+        audio_quality = "96K"
+    else:
+        audio_quality = "128K"
+
+    cmd_audio = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-N", "4",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", audio_quality,
+        "-o", os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s"),
+    ]
+    if has_active_cookies():
+        cmd_audio.extend(["--cookies", COOKIES_FILE_PATH])
+    cmd_audio.append(clean_target_url)
+
+    log.info("Starting requested yt-dlp audio download for %s (quality=%s)", clean_target_url, audio_quality)
+    actual_file = None
+    try:
+        await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True, text=True, timeout=180)
+
+        for fn in os.listdir(temp_dir):
+            if fn.startswith(f"dl_{temp_id}") and not fn.endswith((".part", ".ytdl", ".temp", ".tmp")):
+                fp = os.path.join(temp_dir, fn)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                    actual_file = fp
+                    break
+
+        if not actual_file:
+            log.warning("yt-dlp audio download failed for %s", url)
+            if status_msg:
+                try:
+                    await status_msg.edit_text(f"⚠️ Maaf, gagal mengekstrak audio dari link ini. Link asli: {url}", reply_markup=None)
+                except Exception:
+                    pass
+            return
+
+        filesize = os.path.getsize(actual_file)
+        if filesize > 50 * 1024 * 1024:
+            if status_msg:
+                try:
+                    await status_msg.edit_text(f"⚠️ Ukuran file audio juga melebihi batas 50 MB ({filesize // (1024*1024)} MB). Link asli: {url}", reply_markup=None)
+                except Exception:
+                    pass
+            return
+
+        if status_msg:
+            try:
+                await status_msg.edit_text("⏳ Sedang mengunggah audio ke Telegram...")
+            except Exception:
+                pass
+
+        w, h, duration_val, thumb_bytes = await asyncio.to_thread(extract_video_meta_and_thumb_file, actual_file)
+        thumb_file = io.BytesIO(thumb_bytes) if thumb_bytes else None
+        if thumb_file:
+            thumb_file.name = "thumb.jpg"
+
+        audio_title = (info.get("title") if info else None) or "Audio Track"
+        audio_performer = (info.get("uploader") or info.get("creator") if info else None) or ""
+
+        sent = None
+        with open(actual_file, "rb") as af:
+            try:
+                sent = await bot.send_audio(
+                    chat_id=chat_id,
+                    audio=af,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    duration=duration_val,
+                    thumbnail=thumb_file,
+                    title=audio_title,
+                    performer=audio_performer,
+                    reply_to_message_id=orig_msg_id,
+                    read_timeout=180.0,
+                    write_timeout=180.0,
+                )
+            except Exception as e_reply:
+                log.info("send_audio with reply_to_message_id failed (%s), sending without reply", e_reply)
+                af.seek(0)
+                if thumb_file:
+                    thumb_file.seek(0)
+                sent = await bot.send_audio(
+                    chat_id=chat_id,
+                    audio=af,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    duration=duration_val,
+                    thumbnail=thumb_file,
+                    title=audio_title,
+                    performer=audio_performer,
+                    read_timeout=180.0,
+                    write_timeout=180.0,
+                )
+
+        file_id = sent.audio.file_id if (sent and sent.audio) else ""
+        if file_id:
+            cache_set(url, "audio", file_id, caption)
+            log.info("Successfully uploaded and cached requested audio for %s (file_id=%s)", url, file_id)
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+    except Exception as exc:
+        log.error("execute_pending_audio_download failed for %s: %s", url, exc)
+        if status_msg:
+            try:
+                await status_msg.edit_text(f"⚠️ Terjadi kesalahan saat mengunggah audio: {exc}")
+            except Exception:
+                pass
+    finally:
+        for f in os.listdir(temp_dir):
+            if f.startswith(f"dl_{temp_id}"):
+                try:
+                    os.remove(os.path.join(temp_dir, f))
+                except OSError:
+                    pass
+
+
 async def download_and_send_via_ytdlp(
     url: str,
     message,
@@ -2727,64 +2963,85 @@ async def download_and_send_via_ytdlp(
             return max(candidates, key=os.path.getsize)
         return None
 
-    # Check duration: if video is extraordinarily long (> 30 mins), video cannot fit in 50MB Telegram limit, skip straight to audio
-    is_very_long = False
+    # Step 1: Pre-check duration or known filesize
+    info_size = (info.get("filesize") or info.get("filesize_approx")) if info else None
+    is_oversized_precheck = False
+    detected_mb = None
+
     if info and info.get("duration") and info["duration"] > 1800:
-        is_very_long = True
-        log.info("Media duration is %ds (>1800s). Skipping video download and extracting audio directly.", info["duration"])
+        is_oversized_precheck = True
+        log.info("Media duration is %ds (>1800s). Prompting user for audio confirmation for %s", info["duration"], url)
+    elif info_size and info_size > 50 * 1024 * 1024:
+        is_oversized_precheck = True
+        detected_mb = info_size / (1024 * 1024)
+        log.info("Media info filesize is %.1fMB (>50MB). Prompting user for audio confirmation for %s", detected_mb, url)
+
+    if is_oversized_precheck:
+        return await prompt_large_video_audio_fallback(
+            url=url,
+            clean_target_url=clean_target_url,
+            message=message,
+            caption=caption,
+            status_msg=status_msg,
+            info=info,
+            detected_size_mb=detected_mb,
+        )
 
     actual_file = None
     try:
-        if not is_very_long:
-            # Format selector: try 720p, 480p, 360p, 240p merged to mp4 (WITHOUT --max-filesize which causes fatal aborted .part files)
-            format_spec = (
-                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=720]+bestaudio/"
-                "best[height<=720]/"
-                "bestvideo[height<=480]+bestaudio/"
-                "best[height<=480]/"
-                "bestvideo[height<=360]+bestaudio/"
-                "best[height<=360]/"
-                "best"
-            )
-            cmd_video = [
-                "yt-dlp",
-                "--no-playlist",
-                "--no-warnings",
-                "-N", "4",
-                "--concurrent-fragments", "4",
-                "--buffer-size", "1024K",
-                "--http-chunk-size", "10M",
-                "-f", format_spec,
-                "--merge-output-format", "mp4",
-                "-o", out_template,
-            ]
-            if has_active_cookies():
-                cmd_video.extend(["--cookies", COOKIES_FILE_PATH])
-            cmd_video.append(clean_target_url)
+        # Format selector: try 720p, 480p, 360p, 240p merged to mp4 (WITHOUT --max-filesize which causes fatal aborted .part files)
+        format_spec = (
+            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=720]+bestaudio/"
+            "best[height<=720]/"
+            "bestvideo[height<=480]+bestaudio/"
+            "best[height<=480]/"
+            "bestvideo[height<=360]+bestaudio/"
+            "best[height<=360]/"
+            "best"
+        )
+        cmd_video = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "-N", "4",
+            "--concurrent-fragments", "4",
+            "--buffer-size", "1024K",
+            "--http-chunk-size", "10M",
+            "-f", format_spec,
+            "--merge-output-format", "mp4",
+            "-o", out_template,
+        ]
+        if has_active_cookies():
+            cmd_video.extend(["--cookies", COOKIES_FILE_PATH])
+        cmd_video.append(clean_target_url)
 
-            log.info("Starting yt-dlp video download for %s", clean_target_url)
-            await asyncio.to_thread(subprocess.run, cmd_video, capture_output=True, text=True, timeout=150)
-            actual_file = find_completed_media(temp_dir, temp_id)
+        log.info("Starting yt-dlp video download for %s", clean_target_url)
+        await asyncio.to_thread(subprocess.run, cmd_video, capture_output=True, text=True, timeout=150)
+        actual_file = find_completed_media(temp_dir, temp_id)
 
-        # Step 2: Check if video exceeds 50MB or if video download failed
-        filesize = os.path.getsize(actual_file) if (actual_file and os.path.exists(actual_file)) else 0
-        if filesize > 50 * 1024 * 1024 or not actual_file:
-            if actual_file:
-                log.info("Downloaded video is %.2fMB (>50MB). Attempting Audio extraction fallback for %s", filesize / (1024 * 1024), url)
+        # Check if downloaded video exceeds 50MB -> prompt user
+        if actual_file and os.path.exists(actual_file):
+            filesize = os.path.getsize(actual_file)
+            if filesize > 50 * 1024 * 1024:
+                log.info("Downloaded video is %.2fMB (>50MB). Prompting user for audio confirmation for %s", filesize / (1024 * 1024), url)
                 try:
                     os.remove(actual_file)
                 except OSError:
                     pass
                 actual_file = None
+                return await prompt_large_video_audio_fallback(
+                    url=url,
+                    clean_target_url=clean_target_url,
+                    message=message,
+                    caption=caption,
+                    status_msg=status_msg,
+                    info=info,
+                    detected_size_mb=filesize / (1024 * 1024),
+                )
 
-            if status_msg:
-                try:
-                    await status_msg.edit_text("⏳ Video > 50MB. Mengunduh versi audio...")
-                except Exception:
-                    pass
-
-            # Try Audio extraction (MP3 / M4A)
+        if not actual_file:
+            log.warning("yt-dlp video download returned no file for %s. Attempting audio fallback.", url)
             cmd_audio = [
                 "yt-dlp",
                 "--no-playlist",
@@ -2792,16 +3049,30 @@ async def download_and_send_via_ytdlp(
                 "-N", "4",
                 "-x",
                 "--audio-format", "mp3",
-                "--audio-quality", "5",
+                "--audio-quality", "128K",
                 "-o", os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s"),
             ]
             if has_active_cookies():
                 cmd_audio.extend(["--cookies", COOKIES_FILE_PATH])
             cmd_audio.append(clean_target_url)
-
-            log.info("Starting yt-dlp audio download fallback for %s", clean_target_url)
             await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True, text=True, timeout=120)
             actual_file = find_completed_media(temp_dir, temp_id)
+            if actual_file and os.path.getsize(actual_file) > 50 * 1024 * 1024:
+                size_mb = os.path.getsize(actual_file) / (1024 * 1024)
+                try:
+                    os.remove(actual_file)
+                except OSError:
+                    pass
+                actual_file = None
+                return await prompt_large_video_audio_fallback(
+                    url=url,
+                    clean_target_url=clean_target_url,
+                    message=message,
+                    caption=caption,
+                    status_msg=status_msg,
+                    info=info,
+                    detected_size_mb=size_mb,
+                )
 
         if not actual_file:
             log.warning("All yt-dlp download attempts failed for %s", url)
@@ -2811,12 +3082,15 @@ async def download_and_send_via_ytdlp(
         log.info("Downloaded %s successfully (size: %.2f MB)", actual_file, filesize / (1024 * 1024))
 
         if filesize > 50 * 1024 * 1024:
-            err_msg = f"⚠️ Ukuran media ({filesize // (1024*1024)}MB) melebihi batas upload bot Telegram (50MB). Link asli: {url}"
-            if status_msg:
-                await status_msg.edit_text(err_msg)
-            else:
-                await message.reply_text(err_msg)
-            return True
+            return await prompt_large_video_audio_fallback(
+                url=url,
+                clean_target_url=clean_target_url,
+                message=message,
+                caption=caption,
+                status_msg=status_msg,
+                info=info,
+                detected_size_mb=filesize / (1024 * 1024),
+            )
 
         if status_msg:
             try:
