@@ -28,6 +28,18 @@ from telegram import (
     InputMediaVideo,
     Update,
 )
+try:
+    from telegram import LinkPreviewOptions
+    NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
+except ImportError:
+    NO_LINK_PREVIEW = None
+
+
+def get_no_preview_kwargs() -> dict:
+    if NO_LINK_PREVIEW is not None:
+        return {"link_preview_options": NO_LINK_PREVIEW}
+    return {"disable_web_page_preview": True}
+
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
@@ -286,6 +298,10 @@ def init_db():
         conn.execute("ALTER TABLE user_cookies ADD COLUMN is_enabled INTEGER DEFAULT 1")
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute("DELETE FROM cache WHERE url LIKE '%threads.%' OR url LIKE '%/share/%'")
+    except Exception as e:
+        log.warning("Failed to purge stale threads cache: %s", e)
     conn.commit()
     return conn
 
@@ -648,6 +664,16 @@ def format_caption(info: dict, url: str) -> str:
     max_len = 850
     if len(main_text) > max_len:
         main_text = main_text[:max_len].rsplit(" ", 1)[0] + "..."
+
+    # For text-only posts (no media attached), strictly output clean text blockquote with author attribution.
+    # Strictly DO NOT include any hyperlinks or URLs to prevent Telegram from generating a rich link preview header with avatar.
+    if info.get("_kind") == "text":
+        tag = "blockquote expandable" if (len(main_text) > 120 or "\n" in main_text) else "blockquote"
+        out = f"<{tag}>{main_text}</{tag.split()[0]}>" if main_text else ""
+        if clean_uploader:
+            author_line = f"— @{html.escape(clean_uploader)}"
+            out = f"{out}\n\n{author_line}" if out else author_line
+        return out
 
     platform = detect_platform_name(url)
     escaped_url = html.escape(url)
@@ -1022,10 +1048,11 @@ def is_avatar_url(u: str) -> bool:
     u_lower = u.lower()
     if any(k in u_lower for k in [
         "/rsrc.php", "static.", "profile_pic", "avatar",
-        "-19/", "t51.82787-19", "t51.2885-19", "t39.92108-6"
+        "-19/", "t51.82787-19", "t51.2885-19", "t39.92108-6",
+        "profile_picture", "profilepic", "/identity/"
     ]):
         return True
-    if re.search(r"s\d+x\d+", u_lower):  # e.g. s100x100, s150x150, s320x320, s640x640
+    if re.search(r"s\d+x\d+", u_lower):  # e.g. s50x50, s100x100, s150x150, s320x320, s640x640
         return True
     return False
 
@@ -1125,12 +1152,18 @@ def extract_threads_embed(shortcode: str) -> dict | None:
             if is_avatar_url(clean_src):
                 continue
 
-            # Check if parent belongs to AvatarContainer
+            # Check if image or parent belongs to avatar/profile/identity container
             is_avatar = False
+            img_cls = " ".join(img.get("class", [])) if isinstance(img.get("class"), list) else str(img.get("class") or "")
+            if any(k in img_cls.lower() for k in ["avatar", "profile", "author"]):
+                is_avatar = True
+            if any(k in (img.get("alt") or "").lower() for k in ["profile", "avatar"]):
+                is_avatar = True
+
             p = img.parent
-            while p and p.name != "body":
-                classes = p.get("class") or []
-                if any("Avatar" in cls for cls in classes):
+            while p and p.name not in ("body", "[document]"):
+                p_cls = " ".join(p.get("class", [])) if isinstance(p.get("class"), list) else str(p.get("class") or "")
+                if any(k in p_cls.lower() for k in ["avatar", "profile", "authoridentity", "author"]):
                     is_avatar = True
                     break
                 p = p.parent
@@ -1201,6 +1234,14 @@ def extract_threads(url: str) -> dict | None:
                     m_sc2 = re.search(r"/(?:post|t)/([A-Za-z0-9_-]+)", target_url)
                     if m_sc2:
                         shortcode = m_sc2.group(1)
+                    if not shortcode:
+                        m_sc_json = re.search(r'"shortcode":\s*"([A-Za-z0-9_-]+)"', r_head.text)
+                        if m_sc_json:
+                            shortcode = m_sc_json.group(1)
+                        else:
+                            m_sc_path = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', r_head.text)
+                            if m_sc_path:
+                                shortcode = m_sc_path.group(1)
             except Exception as e:
                 log.debug("Threads resolve redirect error: %s", e)
 
@@ -2115,10 +2156,11 @@ async def riset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cleaned_reply = sanitize_ai_reply(final_reply)
         log.info("🔍 [AI RISET BALAS ke %s]: %s", user_info, cleaned_reply.replace('\n', ' ')[:150])
+        no_prev = get_no_preview_kwargs()
         try:
-            await message.reply_text(cleaned_reply, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            await message.reply_text(cleaned_reply, parse_mode=ParseMode.MARKDOWN, **no_prev)
         except Exception:
-            await message.reply_text(cleaned_reply, disable_web_page_preview=True)
+            await message.reply_text(cleaned_reply, **no_prev)
 
     except Exception as e:
         log.warning("Error in riset_command: %s", e)
@@ -2663,19 +2705,20 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
         # 1. Handle Text-Only Post / Discussion
         if info.get("_kind") == "text":
             text_caption = format_caption(info, url)
+            no_prev = get_no_preview_kwargs()
             try:
                 if status_msg:
                     await status_msg.edit_text(
                         text=text_caption,
                         parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
+                        **no_prev,
                     )
                     sent_id = status_msg.message_id
                 else:
                     sent = await message.reply_text(
                         text=text_caption,
                         parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
+                        **no_prev,
                     )
                     sent_id = sent.message_id
                 cache_set(url, "text", str(sent_id), text_caption)
@@ -2684,9 +2727,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.warning("Failed to send text post: %s", e)
                 if status_msg:
-                    await status_msg.edit_text(text=text_caption)
+                    await status_msg.edit_text(text=text_caption, **no_prev)
                 else:
-                    await message.reply_text(text=text_caption)
+                    await message.reply_text(text=text_caption, **no_prev)
                 return
 
         caption = format_caption(info, url)
@@ -3013,17 +3056,18 @@ async def resend_cached(cached: dict, message, url: str, status_msg=None):
         caption = cached.get("caption")
         
         if cached["kind"] == "text":
+            no_prev = get_no_preview_kwargs()
             if status_msg:
                 await status_msg.edit_text(
                     text=caption,
                     parse_mode=ParseMode.HTML if caption else None,
-                    disable_web_page_preview=True,
+                    **no_prev,
                 )
             else:
                 await message.reply_text(
                     text=caption,
                     parse_mode=ParseMode.HTML if caption else None,
-                    disable_web_page_preview=True,
+                    **no_prev,
                 )
             log.info("Successfully resent cached text for %s", url)
             return
