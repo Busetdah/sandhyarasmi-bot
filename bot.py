@@ -1246,11 +1246,14 @@ def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None
         acodec = info.get("acodec")
         ext = info.get("ext", "")
         if not (is_video and (vcodec == "none" or ext in ("m4a", "aac", "mp3", "opus"))):
+            has_both = True
+            if is_video and (acodec == "none" or (acodec is None and vcodec is not None)):
+                has_both = False
             candidates.append({
                 "url": info["url"],
                 "thumbnail": info.get("thumbnail"),
                 "filesize": info.get("filesize") or info.get("filesize_approx"),
-                "has_both": True,
+                "has_both": has_both,
                 "vcodec": vcodec,
                 "acodec": acodec,
                 "ext": ext,
@@ -1269,7 +1272,7 @@ def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None
         if is_video and (vcodec == "none" or ext in ("m4a", "aac", "mp3", "opus")):
             continue
 
-        has_both = (vcodec not in ("none", None) and acodec not in ("none", None)) or (f.get("format_id") in ("1", "2", "3", "b")) or (f.get("has_audio") is True)
+        has_both = (vcodec not in ("none", None) and acodec not in ("none", None)) or (f.get("format_id") in ("1", "2", "3", "b", "sd", "hd", "browser_native")) or (f.get("has_audio") is True)
         candidates.append({
             "url": f["url"],
             "thumbnail": f.get("thumbnail") or info.get("thumbnail"),
@@ -1291,6 +1294,11 @@ def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None
     prog_unsized = [c for c in candidates if c["has_both"]]
     if prog_unsized:
         return prog_unsized[-1]
+
+    # For video: Never pick a video-only DASH stream without audio!
+    # Returning None forces yt-dlp to download and merge both video + audio streams into a full video with sound.
+    if is_video:
+        return None
 
     sized = [c for c in candidates if c["filesize"] and c["filesize"] <= max_bytes]
     if sized:
