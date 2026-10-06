@@ -16,6 +16,8 @@ import time
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from telegram import (
     BotCommand,
@@ -54,7 +56,7 @@ CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/data/cache.db")
 COOKIES_FILE_PATH = os.environ.get("COOKIES_FILE_PATH", "/data/cookies.txt")
 MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
 EXTRACT_TIMEOUT = int(os.environ.get("EXTRACT_TIMEOUT", 30))
-COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 1.5))
+COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 0.0))
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://172.17.0.1:18080/v1/chat/completions")
 HCNSEC_API_URL = os.environ.get("HCNSEC_API_URL", "https://api.hcnsec.cn/v1/chat/completions")
@@ -82,9 +84,20 @@ SUPPORTED_HOST_HINTS = (
     "youtube.com", "youtu.be",
 )
 
-PROCESS_LOCK = asyncio.Semaphore(1)
+MAX_CONCURRENT_EXTRACTS = int(os.environ.get("MAX_CONCURRENT_EXTRACTS", 5))
+PROCESS_LOCK = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
 USER_LAST_SEEN: dict[int, float] = {}
 USER_AI_LAST_SEEN: dict[int, float] = {}
+
+# High-performance HTTP Session with Keep-Alive connection pooling
+HTTP_SESSION = requests.Session()
+_http_adapter = HTTPAdapter(
+    pool_connections=25,
+    pool_maxsize=25,
+    max_retries=Retry(total=2, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504]),
+)
+HTTP_SESSION.mount("http://", _http_adapter)
+HTTP_SESSION.mount("https://", _http_adapter)
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +673,7 @@ def extract_tiktok(url: str) -> dict | None:
     """Extract TikTok video or photo slides using TikWM API + yt-dlp fallback."""
     try:
         log.info("Querying TikTok via TikWM for %s", url)
-        resp = requests.post("https://tikwm.com/api/", data={"url": url}, timeout=10)
+        resp = HTTP_SESSION.post("https://tikwm.com/api/", data={"url": url}, timeout=10)
         if resp.status_code == 200:
             res_json = resp.json()
             if res_json.get("code") == 0:
@@ -703,7 +716,7 @@ def extract_tiktok(url: str) -> dict | None:
         log.warning("TikWM extraction failed for %s: %s", url, e)
 
     try:
-        r = requests.get(url, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = HTTP_SESSION.get(url, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         final_url = r.url
         info = ytdlp_extract(final_url)
         if info:
@@ -719,7 +732,7 @@ def extract_reddit(url: str) -> dict | None:
     try:
         vx_url = re.sub(r"https?://(?:www\.|old\.|m\.)?reddit\.com", "https://vxreddit.com", url)
         log.info("Querying Reddit via vxreddit: %s", vx_url)
-        resp = requests.get(vx_url, headers={"User-Agent": "TelegramBot (like TwitterBot)"}, timeout=EXTRACT_TIMEOUT)
+        resp = HTTP_SESSION.get(vx_url, headers={"User-Agent": "TelegramBot (like TwitterBot)"}, timeout=EXTRACT_TIMEOUT)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -863,7 +876,7 @@ def extract_ig_embed(clean_url: str) -> dict | None:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
-        resp = requests.get(embed_url, headers=headers, timeout=12)
+        resp = HTTP_SESSION.get(embed_url, headers=headers, timeout=12)
         if resp.status_code != 200:
             return None
 
@@ -966,7 +979,7 @@ def extract_instagram(url: str) -> dict | None:
     # 3. Try official oEmbed API (Public fallback)
     try:
         api_url = f"https://www.instagram.com/api/v1/oembed/?url={quote(clean_url)}"
-        resp = requests.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=EXTRACT_TIMEOUT)
+        resp = HTTP_SESSION.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=EXTRACT_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
             thumb = data.get("thumbnail_url")
@@ -1009,7 +1022,7 @@ def extract_threads(url: str) -> dict | None:
         target_url = url
         if "/share/" in url or "/t/" in url:
             try:
-                r_head = requests.get(url, headers={"User-Agent": "facebookexternalhit/1.1"}, allow_redirects=True, timeout=10)
+                r_head = HTTP_SESSION.get(url, headers={"User-Agent": "facebookexternalhit/1.1"}, allow_redirects=True, timeout=10)
                 if r_head.status_code == 200 and "/post/" in r_head.url:
                     target_url = r_head.url
             except Exception:
@@ -1025,7 +1038,7 @@ def extract_threads(url: str) -> dict | None:
             "Sec-Fetch-User": "?1",
             "Sec-Fetch-Dest": "document",
         }
-        resp = requests.get(target_url, headers=headers, allow_redirects=True, timeout=EXTRACT_TIMEOUT)
+        resp = HTTP_SESSION.get(target_url, headers=headers, allow_redirects=True, timeout=EXTRACT_TIMEOUT)
         if resp.status_code != 200:
             return None
         html_text = resp.text
@@ -1134,7 +1147,7 @@ def og_scrape_fallback(url: str) -> dict | None:
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=EXTRACT_TIMEOUT)
+        resp = HTTP_SESSION.get(url, headers=headers, timeout=EXTRACT_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.info("OG-scrape fetch failed for %s: %s", url, e)
@@ -1707,7 +1720,7 @@ def call_ai_api(payload: dict) -> str | None:
         try:
             p = dict(payload)
             p["model"] = model_name
-            r = requests.post(HCNSEC_API_URL, headers=headers, json=p, timeout=20)
+            r = HTTP_SESSION.post(HCNSEC_API_URL, headers=headers, json=p, timeout=20)
             if r.status_code == 200:
                 data = r.json()
                 content = data["choices"][0]["message"].get("content", "")
@@ -1850,8 +1863,8 @@ async def riset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         def call_searxng():
             try:
-                url = f"{SEARXNG_SERVER_URL}?q={requests.utils.quote(query)}&format=json"
-                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                url = f"{SEARXNG_SERVER_URL}?q={quote(query)}&format=json"
+                r = HTTP_SESSION.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
                 if r.status_code == 200:
                     data = r.json()
                     return data.get("results", [])[:4]
@@ -2278,6 +2291,10 @@ async def download_and_send_via_ytdlp(
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
+        "-N", "4",
+        "--concurrent-fragments", "4",
+        "--buffer-size", "1024K",
+        "--http-chunk-size", "10M",
         "-f", format_spec,
         "--merge-output-format", "mp4",
         "--max-filesize", f"{max_mb}M",
@@ -2310,6 +2327,10 @@ async def download_and_send_via_ytdlp(
                 "yt-dlp",
                 "--no-playlist",
                 "--no-warnings",
+                "-N", "4",
+                "--concurrent-fragments", "4",
+                "--buffer-size", "1024K",
+                "--http-chunk-size", "10M",
                 "--max-filesize", f"{max_mb}M",
                 "--merge-output-format", "mp4",
                 "-o", out_template,
@@ -2419,7 +2440,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             info = await asyncio.to_thread(extract_info, url)
-            await asyncio.sleep(COURTESY_DELAY)
+            if COURTESY_DELAY > 0:
+                await asyncio.sleep(COURTESY_DELAY)
 
         if info is None:
             log.warning("No extractor worked for %s", url)
@@ -2530,9 +2552,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             c = caption if idx == 0 else None
                             pm = ParseMode.HTML if (idx == 0 and c) else None
                             fetch_url = it.get("url")
-                            r = await asyncio.to_thread(requests.get, fetch_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                            r = await asyncio.to_thread(HTTP_SESSION.get, fetch_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
                             if r.status_code != 200:
-                                r = await asyncio.to_thread(requests.get, build_relay_url(fetch_url, it["kind"]), timeout=15)
+                                r = await asyncio.to_thread(HTTP_SESSION.get, build_relay_url(fetch_url, it["kind"]), timeout=15)
                             if r.status_code == 200 and r.content:
                                 buf = io.BytesIO(r.content)
                                 if it["kind"] == "photo":
@@ -2714,7 +2736,7 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                 # Tier 2: Stream Buffer Upload or yt-dlp Fallback
                 uploaded = False
                 try:
-                    r = await asyncio.to_thread(requests.get, relay_url, timeout=35)
+                    r = await asyncio.to_thread(HTTP_SESSION.get, relay_url, timeout=35)
                     if r.status_code == 200 and r.content:
                         thumb_file = None
                         if kind in ("video", "animation"):
