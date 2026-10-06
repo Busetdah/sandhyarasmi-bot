@@ -24,6 +24,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaAnimation,
+    InputMediaAudio,
     InputMediaPhoto,
     InputMediaVideo,
     Update,
@@ -321,7 +322,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     conn.commit()
@@ -2685,7 +2686,8 @@ async def download_and_send_via_ytdlp(
     message,
     caption: str,
     status_msg=None,
-    max_mb: int = 49
+    max_mb: int = 49,
+    info: dict | None = None
 ) -> bool:
     """Download video/audio directly using yt-dlp with best quality under 50MB and upload to Telegram."""
     if status_msg:
@@ -2694,51 +2696,58 @@ async def download_and_send_via_ytdlp(
         except Exception:
             pass
 
+    # Clean playlist / radio parameters from YouTube URL if any
+    clean_target_url = url
+    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        clean_target_url = re.sub(r"([?&])list=[^&]*", r"\1", clean_target_url)
+        clean_target_url = re.sub(r"([?&])start_radio=[^&]*", r"\1", clean_target_url)
+        clean_target_url = re.sub(r"([?&])index=[^&]*", r"\1", clean_target_url)
+        clean_target_url = clean_target_url.rstrip("&?").replace("?&", "?")
+
     temp_id = int(time.time() * 1000)
     temp_dir = os.environ.get("TEMP_DIR", "/app/temp")
     os.makedirs(temp_dir, exist_ok=True)
     out_template = os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s")
     final_mp4 = os.path.join(temp_dir, f"dl_{temp_id}.mp4")
 
-    # Format selector: best video + best audio merged into mp4 under max_mb
-    format_spec = f"bestvideo[filesize<{max_mb}M]+bestaudio/best[filesize<{max_mb}M]/best[filesize_approx<{max_mb}M]/best"
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "-N", "4",
-        "--concurrent-fragments", "4",
-        "--buffer-size", "1024K",
-        "--http-chunk-size", "10M",
-        "-f", format_spec,
-        "--merge-output-format", "mp4",
-        "--max-filesize", f"{max_mb}M",
-        "-o", out_template,
-    ]
-    if has_active_cookies():
-        cmd.extend(["--cookies", COOKIES_FILE_PATH])
-    cmd.append(url)
-
-    log.info("Starting yt-dlp direct download for %s", url)
-    try:
-        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=120)
-        
-        # Locate the downloaded file
-        actual_file = None
+    def find_completed_media(temp_dir_path: str, tid: int) -> str | None:
         if os.path.exists(final_mp4) and os.path.getsize(final_mp4) > 0:
-            actual_file = final_mp4
-        else:
-            for f in os.listdir(temp_dir):
-                if f.startswith(f"dl_{temp_id}"):
-                    p = os.path.join(temp_dir, f)
-                    if os.path.getsize(p) > 0:
-                        actual_file = p
-                        break
+            return final_mp4
+        candidates = []
+        for fn in os.listdir(temp_dir_path):
+            if fn.startswith(f"dl_{tid}") and not fn.endswith((".part", ".ytdl", ".temp", ".tmp")):
+                fp = os.path.join(temp_dir_path, fn)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                    candidates.append(fp)
+        if candidates:
+            # Prefer mp4 if exists, else largest completed file
+            for c in candidates:
+                if c.endswith(".mp4"):
+                    return c
+            return max(candidates, key=os.path.getsize)
+        return None
 
-        if not actual_file:
-            log.warning("yt-dlp download failed for %s (exit code %s): %s", url, proc.returncode, proc.stderr[-300:] if proc.stderr else proc.stdout[-300:])
-            # Fallback with simple -f best
-            cmd_fallback = [
+    # Check duration: if video is extraordinarily long (> 30 mins), video cannot fit in 50MB Telegram limit, skip straight to audio
+    is_very_long = False
+    if info and info.get("duration") and info["duration"] > 1800:
+        is_very_long = True
+        log.info("Media duration is %ds (>1800s). Skipping video download and extracting audio directly.", info["duration"])
+
+    actual_file = None
+    try:
+        if not is_very_long:
+            # Format selector: try 720p, 480p, 360p, 240p merged to mp4 (WITHOUT --max-filesize which causes fatal aborted .part files)
+            format_spec = (
+                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=720]+bestaudio/"
+                "best[height<=720]/"
+                "bestvideo[height<=480]+bestaudio/"
+                "best[height<=480]/"
+                "bestvideo[height<=360]+bestaudio/"
+                "best[height<=360]/"
+                "best"
+            )
+            cmd_video = [
                 "yt-dlp",
                 "--no-playlist",
                 "--no-warnings",
@@ -2746,24 +2755,53 @@ async def download_and_send_via_ytdlp(
                 "--concurrent-fragments", "4",
                 "--buffer-size", "1024K",
                 "--http-chunk-size", "10M",
-                "--max-filesize", f"{max_mb}M",
+                "-f", format_spec,
                 "--merge-output-format", "mp4",
                 "-o", out_template,
-                url
             ]
             if has_active_cookies():
-                cmd_fallback.insert(-1, "--cookies")
-                cmd_fallback.insert(-1, COOKIES_FILE_PATH)
-            proc2 = await asyncio.to_thread(subprocess.run, cmd_fallback, capture_output=True, text=True, timeout=120)
-            if os.path.exists(final_mp4) and os.path.getsize(final_mp4) > 0:
-                actual_file = final_mp4
-            else:
-                for f in os.listdir(temp_dir):
-                    if f.startswith(f"dl_{temp_id}"):
-                        p = os.path.join(temp_dir, f)
-                        if os.path.getsize(p) > 0:
-                            actual_file = p
-                            break
+                cmd_video.extend(["--cookies", COOKIES_FILE_PATH])
+            cmd_video.append(clean_target_url)
+
+            log.info("Starting yt-dlp video download for %s", clean_target_url)
+            await asyncio.to_thread(subprocess.run, cmd_video, capture_output=True, text=True, timeout=150)
+            actual_file = find_completed_media(temp_dir, temp_id)
+
+        # Step 2: Check if video exceeds 50MB or if video download failed
+        filesize = os.path.getsize(actual_file) if (actual_file and os.path.exists(actual_file)) else 0
+        if filesize > 50 * 1024 * 1024 or not actual_file:
+            if actual_file:
+                log.info("Downloaded video is %.2fMB (>50MB). Attempting Audio extraction fallback for %s", filesize / (1024 * 1024), url)
+                try:
+                    os.remove(actual_file)
+                except OSError:
+                    pass
+                actual_file = None
+
+            if status_msg:
+                try:
+                    await status_msg.edit_text("⏳ Video > 50MB. Mengunduh versi audio...")
+                except Exception:
+                    pass
+
+            # Try Audio extraction (MP3 / M4A)
+            cmd_audio = [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "-N", "4",
+                "-x",
+                "--audio-format", "mp3",
+                "--audio-quality", "5",
+                "-o", os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s"),
+            ]
+            if has_active_cookies():
+                cmd_audio.extend(["--cookies", COOKIES_FILE_PATH])
+            cmd_audio.append(clean_target_url)
+
+            log.info("Starting yt-dlp audio download fallback for %s", clean_target_url)
+            await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True, text=True, timeout=120)
+            actual_file = find_completed_media(temp_dir, temp_id)
 
         if not actual_file:
             log.warning("All yt-dlp download attempts failed for %s", url)
@@ -2786,30 +2824,53 @@ async def download_and_send_via_ytdlp(
             except Exception:
                 pass
 
-        # Extract metadata and thumbnail
+        # Probe media: inspect width, height, duration, thumbnail
         w, h, dur, thumb_bytes = await asyncio.to_thread(extract_video_meta_and_thumb_file, actual_file)
         thumb_file = io.BytesIO(thumb_bytes) if thumb_bytes else None
         if thumb_file:
             thumb_file.name = "thumb.jpg"
 
-        with open(actual_file, "rb") as vf:
-            sent = await message.reply_video(
-                video=vf,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                width=w,
-                height=h,
-                duration=dur,
-                thumbnail=thumb_file,
-                supports_streaming=True,
-                read_timeout=180.0,
-                write_timeout=180.0,
-            )
+        # If the file has NO video stream (audio-only, e.g. mp3/m4a/opus/f251): Send as Telegram Audio!
+        is_audio_only = (w is None or h is None) or actual_file.lower().endswith((".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac"))
 
-        file_id = sent.video.file_id if sent.video else ""
-        if file_id:
-            cache_set(url, "video", file_id, caption)
-            log.info("Successfully uploaded and cached media for %s (file_id=%s)", url, file_id)
+        if is_audio_only:
+            log.info("File has no video stream. Sending as Telegram Audio for %s", url)
+            audio_title = (info.get("title") if info else None) or "Audio Track"
+            audio_performer = (info.get("uploader") or info.get("creator") if info else None) or ""
+            with open(actual_file, "rb") as af:
+                sent = await message.reply_audio(
+                    audio=af,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    duration=dur,
+                    thumbnail=thumb_file,
+                    title=audio_title,
+                    performer=audio_performer,
+                    read_timeout=180.0,
+                    write_timeout=180.0,
+                )
+            file_id = sent.audio.file_id if sent.audio else ""
+            if file_id:
+                cache_set(url, "audio", file_id, caption)
+                log.info("Successfully uploaded and cached audio for %s (file_id=%s)", url, file_id)
+        else:
+            with open(actual_file, "rb") as vf:
+                sent = await message.reply_video(
+                    video=vf,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    width=w,
+                    height=h,
+                    duration=dur,
+                    thumbnail=thumb_file,
+                    supports_streaming=True,
+                    read_timeout=180.0,
+                    write_timeout=180.0,
+                )
+            file_id = sent.video.file_id if sent.video else ""
+            if file_id:
+                cache_set(url, "video", file_id, caption)
+                log.info("Successfully uploaded and cached video for %s (file_id=%s)", url, file_id)
 
         if status_msg:
             try:
@@ -3023,7 +3084,7 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
         # Check if direct relay is not suitable (YouTube, >20MB, or separate DASH streams)
         if is_youtube or direct is None or (filesize and filesize > 20 * 1024 * 1024):
             log.info("Direct relay URL not suitable (is_yt=%s, direct=%s, size=%s). Trying yt-dlp downloader for %s", is_youtube, direct is not None, filesize, url)
-            success = await download_and_send_via_ytdlp(url, message, caption, status_msg)
+            success = await download_and_send_via_ytdlp(url, message, caption, status_msg, info=info)
             if success:
                 return
             if direct is None:
@@ -3206,7 +3267,7 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
 
                 if not uploaded:
                     log.info("Trying yt-dlp direct download fallback for %s", url)
-                    success = await download_and_send_via_ytdlp(url, message, caption, status_msg)
+                    success = await download_and_send_via_ytdlp(url, message, caption, status_msg, info=info)
                     if not success:
                         err_msg = f"⚠️ Maaf, gagal memuat media. Link asli: {url}"
                         if status_msg:
@@ -3286,6 +3347,11 @@ async def resend_cached(cached: dict, message, url: str, status_msg=None):
                         media=InputMediaVideo(media=cached["file_id"], caption=caption, parse_mode=ParseMode.HTML if caption else None, supports_streaming=True)
                     )
                     was_edited = True
+                elif cached["kind"] == "audio":
+                    await status_msg.edit_media(
+                        media=InputMediaAudio(media=cached["file_id"], caption=caption, parse_mode=ParseMode.HTML if caption else None)
+                    )
+                    was_edited = True
                 elif cached["kind"] == "animation":
                     await status_msg.edit_media(
                         media=InputMediaAnimation(media=cached["file_id"], caption=caption, parse_mode=ParseMode.HTML if caption else None)
@@ -3307,6 +3373,12 @@ async def resend_cached(cached: dict, message, url: str, status_msg=None):
                     caption=caption,
                     parse_mode=ParseMode.HTML if caption else None,
                     supports_streaming=True,
+                )
+            elif cached["kind"] == "audio":
+                await message.reply_audio(
+                    audio=cached["file_id"],
+                    caption=caption,
+                    parse_mode=ParseMode.HTML if caption else None,
                 )
             else:
                 await message.reply_photo(
