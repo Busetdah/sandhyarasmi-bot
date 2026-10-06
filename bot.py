@@ -1159,12 +1159,11 @@ def extract_threads_embed(shortcode: str) -> dict | None:
 
 
 def extract_threads(url: str) -> dict | None:
-    """Extract real attached media (MP4 video, photo, album, or visual card for text) and caption from Threads posts."""
+    """Extract real attached media (MP4 video, photo, album) or clean text from Threads posts."""
     try:
         # 1. Resolve share / short links to canonical post URL
         target_url = url
         shortcode = None
-        card_image = None
 
         m_sc = re.search(r"/(?:post|t)/([A-Za-z0-9_-]+)", url)
         if m_sc:
@@ -1183,48 +1182,13 @@ def extract_threads(url: str) -> dict | None:
                     m_sc2 = re.search(r"/(?:post|t)/([A-Za-z0-9_-]+)", target_url)
                     if m_sc2:
                         shortcode = m_sc2.group(1)
-                    # Check if Meta's official Threads visual card image is present
-                    m_card = re.search(r'property="og:image"\s+content="([^"]+)"', r_head.text)
-                    if m_card:
-                        card_image = html.unescape(m_card.group(1)).replace("&amp;", "&")
             except Exception as e:
                 log.debug("Threads resolve redirect error: %s", e)
 
-        # 2. Try Public Embed (Fast, zero cookies, full carousel album support)
+        # 2. Try Public Embed (Fast, zero cookies, full carousel album & text support)
         if shortcode:
             embed_data = extract_threads_embed(shortcode)
             if embed_data:
-                # If text-only post, attach Meta's simulated visual Threads card image
-                if embed_data.get("_kind") == "text":
-                    card_url = card_image
-                    if not card_url:
-                        try:
-                            card_resp = HTTP_SESSION.get(
-                                f"https://www.threads.net/t/{shortcode}",
-                                headers={"User-Agent": "facebookexternalhit/1.1"},
-                                allow_redirects=True,
-                                timeout=10,
-                            )
-                            if card_resp.status_code == 200:
-                                m_c = re.search(r'property="og:image"\s+content="([^"]+)"', card_resp.text)
-                                if m_c:
-                                    card_url = html.unescape(m_c.group(1)).replace("&amp;", "&")
-                        except Exception as e_c:
-                            log.debug("Failed to fetch Threads card image: %s", e_c)
-
-                    if card_url and not any(k in card_url for k in ["/rsrc.php", "profile_pic", "s150x150", "s100x100"]):
-                        log.info("Threads text post sending simulated visual card for %s: %s", shortcode, card_url[:80])
-                        return {
-                            "formats": [],
-                            "url": card_url,
-                            "ext": "jpg",
-                            "filesize": None,
-                            "title": embed_data.get("title", ""),
-                            "description": embed_data.get("description", ""),
-                            "uploader": embed_data.get("uploader", ""),
-                            "_kind": "photo",
-                        }
-
                 return embed_data
 
         # 3. Fallback: Fetch canonical post with browser navigation headers
@@ -1257,12 +1221,9 @@ def extract_threads(url: str) -> dict | None:
                 og_title = content
             elif prop in ["og:description", "twitter:description", "description"] and not og_desc:
                 og_desc = content
-            elif prop in ["og:image", "twitter:image"]:
-                if any(k in content for k in ["/rsrc.php", "profile_pic", "s150x150", "s100x100", "s50x50"]):
-                    continue
-                if "t39.92108-6" in content:
-                    card_image = card_image or content
-                elif not og_image:
+            elif prop in ["og:image", "twitter:image"] and not og_image:
+                # Ignore avatars, generic icons, and card templates (t39.92108-6)
+                if not any(k in content for k in ["/rsrc.php", "profile_pic", "s150x150", "s100x100", "s50x50", "t39.92108-6"]):
                     og_image = content
             elif prop in ["og:video", "og:video:secure_url", "twitter:player"] and not og_video:
                 if not any(k in content for k in ["/rsrc.php", "static."]):
@@ -1312,11 +1273,10 @@ def extract_threads(url: str) -> dict | None:
                 "_kind": "video",
             }
 
-        # Raw Attached Image(s) or Visual Card
-        image_url = og_image or card_image
-        if image_url:
-            clean_image_url = image_url.replace(r'\/', '/').replace(r'\u0026', '&').replace('&amp;', '&')
-            log.info("Threads photo/card found via canonical page: %s", clean_image_url[:80])
+        # Raw Attached Image(s)
+        if og_image:
+            clean_image_url = og_image.replace(r'\/', '/').replace(r'\u0026', '&').replace('&amp;', '&')
+            log.info("Threads photo found via canonical page: %s", clean_image_url[:80])
             return {
                 "formats": [],
                 "url": clean_image_url,
