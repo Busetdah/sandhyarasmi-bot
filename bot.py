@@ -9,11 +9,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 import requests
@@ -136,6 +138,31 @@ HTTP_SESSION.mount("http://", _http_adapter)
 HTTP_SESSION.mount("https://", _http_adapter)
 
 
+def get_fast_temp_dir() -> str:
+    """Detect and return ultra-fast RAM disk (/dev/shm) if available to eliminate laptop HDD bottlenecks."""
+    env_dir = os.environ.get("TEMP_DIR")
+    if env_dir:
+        os.makedirs(env_dir, exist_ok=True)
+        return env_dir
+    if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        shm_dir = "/dev/shm/sandhyarasmi_temp"
+        os.makedirs(shm_dir, exist_ok=True)
+        return shm_dir
+    default_dir = os.path.join(tempfile.gettempdir(), "sandhyarasmi_temp")
+    os.makedirs(default_dir, exist_ok=True)
+    return default_dir
+
+
+def get_aria2c_cmd_args() -> list[str]:
+    """Return aria2c multi-connection download flags if aria2c is installed on system."""
+    if shutil.which("aria2c"):
+        return [
+            "--downloader", "aria2c",
+            "--downloader-args", "aria2c:-s 8 -x 8 -k 1M -j 8 --min-split-size=1M",
+        ]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Helpers: Media Probing (Width, Height, Duration, Thumbnail)
 # ---------------------------------------------------------------------------
@@ -191,7 +218,7 @@ def extract_video_meta_and_thumb(video_bytes: bytes) -> tuple[int | None, int | 
     """Inspect video bytes with ffprobe/ffmpeg to extract accurate width, height, duration, and thumbnail poster."""
     temp_name = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+        with tempfile.NamedTemporaryFile(dir=get_fast_temp_dir(), suffix=".mp4", delete=False) as tf:
             tf.write(video_bytes)
             temp_name = tf.name
         return extract_video_meta_and_thumb_file(temp_name)
@@ -809,51 +836,68 @@ def extract_tiktok(url: str) -> dict | None:
 
     endpoints = ["https://tikwm.com/api/", "https://www.tikwm.com/api/"]
 
-    for candidate_url in urls_to_try:
-        for ep in endpoints:
+    def _query_tikwm(ep: str, cand_url: str) -> dict | None:
+        try:
+            log.info("Querying TikTok via TikWM (%s) for %s", ep, cand_url)
+            resp = HTTP_SESSION.post(ep, data={"url": cand_url}, timeout=8)
+            if resp.status_code == 200:
+                res_json = resp.json()
+                if res_json.get("code") == 0:
+                    data = res_json.get("data", {})
+                    title = data.get("title") or ""
+                    author = data.get("author", {}).get("unique_id") or data.get("author", {}).get("nickname") or ""
+                    uploader = f"@{author}" if author else ""
+                    duration = data.get("duration")
+
+                    images = data.get("images")
+                    if images and isinstance(images, list) and len(images) > 0:
+                        log.info("TikTok photo slide detected with %d images", len(images))
+                        return {
+                            "_kind": "album",
+                            "items": [{"url": img, "kind": "photo"} for img in images],
+                            "title": title,
+                            "description": title,
+                            "uploader": uploader,
+                        }
+
+                    play_url = data.get("play") or data.get("wmplay")
+                    size = data.get("size")
+                    if play_url:
+                        log.info("TikTok video extracted via TikWM (%s, size: %s bytes)", ep, size)
+                        return {
+                            "formats": [],
+                            "url": play_url,
+                            "thumbnail": data.get("cover"),
+                            "ext": "mp4",
+                            "filesize": size,
+                            "width": data.get("width"),
+                            "height": data.get("height"),
+                            "duration": duration,
+                            "title": title,
+                            "description": title,
+                            "uploader": uploader,
+                            "_kind": "video",
+                        }
+        except Exception as e:
+            log.warning("TikWM (%s) extraction failed for %s: %s", ep, cand_url, e)
+        return None
+
+    # Race endpoints concurrently across candidate URLs
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_req = {
+            executor.submit(_query_tikwm, ep, cand_u): (ep, cand_u)
+            for cand_u in urls_to_try
+            for ep in endpoints
+        }
+        for future in as_completed(future_to_req):
             try:
-                log.info("Querying TikTok via TikWM (%s) for %s", ep, candidate_url)
-                resp = HTTP_SESSION.post(ep, data={"url": candidate_url}, timeout=10)
-                if resp.status_code == 200:
-                    res_json = resp.json()
-                    if res_json.get("code") == 0:
-                        data = res_json.get("data", {})
-                        title = data.get("title") or ""
-                        author = data.get("author", {}).get("unique_id") or data.get("author", {}).get("nickname") or ""
-                        uploader = f"@{author}" if author else ""
-                        duration = data.get("duration")
-
-                        images = data.get("images")
-                        if images and isinstance(images, list) and len(images) > 0:
-                            log.info("TikTok photo slide detected with %d images", len(images))
-                            return {
-                                "_kind": "album",
-                                "items": [{"url": img, "kind": "photo"} for img in images],
-                                "title": title,
-                                "description": title,
-                                "uploader": uploader,
-                            }
-
-                        play_url = data.get("play") or data.get("wmplay")
-                        size = data.get("size")
-                        if play_url:
-                            log.info("TikTok video extracted via TikWM (size: %s bytes)", size)
-                            return {
-                                "formats": [],
-                                "url": play_url,
-                                "thumbnail": data.get("cover"),
-                                "ext": "mp4",
-                                "filesize": size,
-                                "width": data.get("width"),
-                                "height": data.get("height"),
-                                "duration": duration,
-                                "title": title,
-                                "description": title,
-                                "uploader": uploader,
-                                "_kind": "video",
-                            }
+                res = future.result()
+                if res:
+                    for f in future_to_req:
+                        f.cancel()
+                    return res
             except Exception as e:
-                log.warning("TikWM (%s) extraction failed for %s: %s", ep, candidate_url, e)
+                log.debug("TikWM race future exception: %s", e)
 
     # Fallback: yt-dlp
     target_dl_url = resolved_url or url
@@ -1113,11 +1157,10 @@ def extract_ig_embed(clean_url: str) -> dict | None:
 
 
 def extract_instagram(url: str) -> dict | None:
-    """Extract Instagram post using True Hybrid Pipeline:
-    1. Try Public Embed JSON (No cookies, full carousel support)
-    2. Try Public yt-dlp (No cookies)
-    3. Try Public oEmbed API (No cookies)
-    4. Fallback: Authenticated yt-dlp with Cookies ONLY if public fails.
+    """Extract Instagram post using Optimized Hybrid Pipeline:
+    1. Try Public Embed JSON (Fast ~0.5s, No cookies, full carousel and video/photo support)
+    2. Try yt-dlp (Authenticated if cookies exist, else public)
+    3. Fallback: Official oEmbed API (Fast public metadata fallback)
     """
     clean_url = re.sub(r"\?.*$", "", url).rstrip("/") + "/"
     log.info("Extracting Instagram (Hybrid Pipeline) for clean URL: %s", clean_url)
@@ -1128,13 +1171,15 @@ def extract_instagram(url: str) -> dict | None:
         log.info("Instagram extracted via Public Embed (Zero Cookies)")
         return embed_info
 
-    # 2. Try Public yt-dlp (No Cookies)
-    public_ytdlp = ytdlp_extract(clean_url, use_cookies=False)
-    if public_ytdlp and (public_ytdlp.get("formats") or public_ytdlp.get("url") or public_ytdlp.get("entries")):
-        log.info("Instagram extracted via Public yt-dlp (Zero Cookies)")
-        return public_ytdlp
+    # 2. Try yt-dlp (Directly use authenticated cookies if available to save 4-5s of failing public calls)
+    use_auth = has_active_cookies()
+    log.info("Attempting yt-dlp extraction for Instagram (authenticated=%s) for %s", use_auth, clean_url)
+    ytdlp_res = ytdlp_extract(clean_url, use_cookies=use_auth)
+    if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
+        log.info("Instagram extracted via yt-dlp (authenticated=%s)", use_auth)
+        return ytdlp_res
 
-    # 3. Try official oEmbed API (Public fallback)
+    # 3. Fallback: Try official oEmbed API (Public metadata & photo fallback)
     try:
         api_url = f"https://www.instagram.com/api/v1/oembed/?url={quote(clean_url)}"
         resp = HTTP_SESSION.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=EXTRACT_TIMEOUT)
@@ -1145,7 +1190,7 @@ def extract_instagram(url: str) -> dict | None:
             author = data.get("author_name") or ""
             uploader = f"@{author}" if author else ""
             if thumb:
-                log.info("Instagram extracted via Public oEmbed (Zero Cookies)")
+                log.info("Instagram extracted via Public oEmbed fallback")
                 return {
                     "formats": [],
                     "url": thumb,
@@ -1161,14 +1206,6 @@ def extract_instagram(url: str) -> dict | None:
                 }
     except Exception as e:
         log.info("extract_instagram oembed failed for %s: %s", clean_url, e)
-
-    # 4. Fallback: Authenticated yt-dlp with Cookies ONLY if public attempts fail
-    if has_active_cookies():
-        log.info("Public extraction failed. Attempting authenticated extraction with Cookies for %s", clean_url)
-        auth_ytdlp = ytdlp_extract(clean_url, use_cookies=True)
-        if auth_ytdlp and (auth_ytdlp.get("formats") or auth_ytdlp.get("url") or auth_ytdlp.get("entries")):
-            log.info("Instagram extracted via Authenticated Cookies fallback!")
-            return auth_ytdlp
 
     return None
 
@@ -3245,7 +3282,7 @@ async def execute_pending_audio_download(session: dict, bot, status_msg=None):
     info = session.get("info")
 
     temp_id = int(time.time() * 1000)
-    temp_dir = os.environ.get("TEMP_DIR", "/app/temp")
+    temp_dir = get_fast_temp_dir()
     os.makedirs(temp_dir, exist_ok=True)
 
     dur = (info.get("duration") if info else None)
@@ -3270,6 +3307,8 @@ async def execute_pending_audio_download(session: dict, bot, status_msg=None):
         cmd_audio.extend(["--cookies", COOKIES_FILE_PATH])
     if "youtube.com" in clean_target_url.lower() or "youtu.be" in clean_target_url.lower():
         cmd_audio.extend(["--extractor-args", "youtube:player_client=default,ios"])
+    else:
+        cmd_audio.extend(get_aria2c_cmd_args())
     cmd_audio.append(clean_target_url)
 
     log.info("Starting requested yt-dlp audio download for %s (quality=%s)", clean_target_url, audio_quality)
@@ -3409,7 +3448,7 @@ async def download_and_send_via_ytdlp(
             clean_target_url = clean_target_url.rstrip("?&")
 
     temp_id = int(time.time() * 1000)
-    temp_dir = os.environ.get("TEMP_DIR", "/app/temp")
+    temp_dir = get_fast_temp_dir()
     os.makedirs(temp_dir, exist_ok=True)
     out_template = os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s")
     final_mp4 = os.path.join(temp_dir, f"dl_{temp_id}.mp4")
@@ -3485,6 +3524,7 @@ async def download_and_send_via_ytdlp(
             cmd_video.extend(["--extractor-args", "youtube:player_client=default,ios"])
         else:
             cmd_video.extend(["--concurrent-fragments", "4", "--http-chunk-size", "10M"])
+            cmd_video.extend(get_aria2c_cmd_args())
         if has_active_cookies() and is_ig:
             cmd_video.extend(["--cookies", COOKIES_FILE_PATH])
         cmd_video.append(clean_target_url)
@@ -3508,6 +3548,8 @@ async def download_and_send_via_ytdlp(
             ]
             if is_yt:
                 cmd_fallback.extend(["--extractor-args", "youtube:player_client=default,ios"])
+            else:
+                cmd_fallback.extend(get_aria2c_cmd_args())
             if has_active_cookies() and is_ig:
                 cmd_fallback.extend(["--cookies", COOKIES_FILE_PATH])
             cmd_fallback.append(clean_target_url)
@@ -3550,6 +3592,8 @@ async def download_and_send_via_ytdlp(
             ]
             if is_yt:
                 cmd_audio.extend(["--extractor-args", "youtube:player_client=default,ios"])
+            else:
+                cmd_audio.extend(get_aria2c_cmd_args())
             if has_active_cookies() and is_ig:
                 cmd_audio.extend(["--cookies", COOKIES_FILE_PATH])
             cmd_audio.append(clean_target_url)
@@ -3668,6 +3712,12 @@ async def download_and_send_via_ytdlp(
 
 async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
     log.info("Processing link: %s", url)
+
+    # Immediately trigger native Telegram chat action for instant feedback
+    try:
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+    except Exception as e:
+        log.debug("send_chat_action notice: %s", e)
 
     status_msg = None
     try:
