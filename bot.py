@@ -686,6 +686,10 @@ def clean_metadata_fields(info: dict, url: str) -> tuple[str, str]:
 
     # 1b. Handle Facebook author - title pattern: "Author - Description" or "Author | Description"
     if "facebook.com" in url.lower() or "fb.watch" in url.lower() or detect_platform_name(url) == "facebook":
+        if is_fb_generic_or_error(title):
+            title = ""
+        if is_fb_generic_or_error(desc):
+            desc = ""
         if title:
             if uploader and title.startswith(f"{uploader} - "):
                 title = title[len(uploader) + 3:].strip()
@@ -707,6 +711,8 @@ def clean_metadata_fields(info: dict, url: str) -> tuple[str, str]:
                     if len(parts[0]) < 80 and "\n" not in parts[0]:
                         uploader = parts[0].strip()
                         title = parts[1].strip()
+        if is_fb_generic_or_error(title):
+            title = ""
 
     # 2. Strip generic stats / views from uploader
     if uploader and any(k in uploader.lower() for k in ["views", "reactions", "likes", "subscribers", "followers"]):
@@ -1627,6 +1633,41 @@ def og_scrape_fallback(url: str) -> dict | None:
     return None
 
 
+def is_fb_generic_or_error(text: str) -> bool:
+    """Detect if title, description, or caption is Facebook's generic placeholder, login prompt, or unavailable error."""
+    if not text:
+        return True
+    t_low = text.lower().strip()
+    if t_low in (
+        "facebook",
+        "log in to facebook",
+        "login ke facebook",
+        "masuk ke facebook",
+        "facebook - masuk atau daftar",
+        "facebook - log in or sign up",
+        "log in or sign up to view",
+        "login ke facebook | facebook",
+        "log in to facebook | facebook",
+        "facebook – log in or sign up",
+        "facebook - masuk",
+    ):
+        return True
+    if any(k in t_low for k in [
+        "postingan facebook ini tidak tersedia lagi",
+        "this content isn't available",
+        "this page isn't available",
+        "halaman ini tidak tersedia",
+        "login ke facebook untuk mulai membagikan",
+        "log in to facebook to start sharing",
+        "log in or sign up to view",
+        "konten tidak ditemukan",
+        "login to facebook",
+        "masuk ke facebook untuk mulai",
+    ]):
+        return True
+    return False
+
+
 def extract_facebook(url: str) -> dict | None:
     """Extract Facebook media (video, reels, photo, album, or text) via yt-dlp & OpenGraph scraper."""
     clean_url = url.strip()
@@ -1668,9 +1709,39 @@ def extract_facebook(url: str) -> dict | None:
         tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
         return tag["content"] if tag and tag.get("content") else None
 
-    og_url = meta("og:url") or clean_url
+    # Resolve canonical and redirected URLs (especially for /share/ shortlinks)
+    canonical_candidates = []
+    og_url = meta("og:url")
+    if og_url:
+        canonical_candidates.append(og_url)
+    if hasattr(resp, "history") and resp.history:
+        for hist in resp.history:
+            loc = hist.headers.get("Location")
+            if loc and loc not in canonical_candidates:
+                canonical_candidates.append(loc)
+    if resp.url and resp.url not in canonical_candidates:
+        canonical_candidates.append(resp.url)
+
+    # Check canonical candidates for video / reel hints (e.g. facebook.com/share link resolving to /reel/)
+    for cand in canonical_candidates:
+        if any(k in cand.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/"]):
+            try:
+                info = ytdlp_extract(cand)
+                if info is not None:
+                    if info.get("_kind") != "album":
+                        info["_kind"] = "photo" if info.get("ext") in ("jpg", "jpeg", "png", "webp") else "video"
+                    log.info("Facebook video extracted via canonical URL (%s) for %s", cand, clean_url)
+                    return info
+            except Exception as e:
+                log.debug("Facebook canonical yt-dlp attempt error for %s: %s", cand, e)
+
     og_title = meta("og:title") or meta("twitter:title") or ""
     og_desc = meta("og:description") or meta("twitter:description") or meta("description") or ""
+
+    if is_fb_generic_or_error(og_title):
+        og_title = ""
+    if is_fb_generic_or_error(og_desc):
+        og_desc = ""
 
     uploader = ""
     if og_title:
@@ -1693,18 +1764,8 @@ def extract_facebook(url: str) -> dict | None:
                 uploader = parts[0].strip()
 
     caption = og_desc or og_title
-
-    # 3. If og_url points to a canonical reel or watch video and we haven't tried yt-dlp on it yet:
-    if og_url and og_url != clean_url and any(k in og_url.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/"]):
-        try:
-            info = ytdlp_extract(og_url)
-            if info is not None:
-                if info.get("_kind") != "album":
-                    info["_kind"] = "photo" if info.get("ext") in ("jpg", "jpeg", "png", "webp") else "video"
-                log.info("Facebook video extracted via canonical yt-dlp (%s) for %s", og_url, clean_url)
-                return info
-        except Exception as e:
-            log.debug("Facebook canonical yt-dlp attempt error: %s", e)
+    if is_fb_generic_or_error(caption):
+        caption = ""
 
     # 4. Check for direct video tags
     video_url = meta("og:video:secure_url") or meta("og:video") or meta("twitter:player:stream")
@@ -1805,8 +1866,8 @@ def extract_facebook(url: str) -> dict | None:
         except Exception:
             pass
 
-    # 7. Text-only fallback if title or description exists
-    if caption:
+    # 7. Text-only fallback ONLY if legitimate non-generic caption exists
+    if caption and not is_fb_generic_or_error(caption):
         log.info("Facebook text-only post extracted for %s", clean_url)
         return {
             "_kind": "text",
@@ -3762,6 +3823,12 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                     await status_msg.edit_text(group_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 else:
                     await message.reply_text(group_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            elif "facebook.com" in url.lower() or "fb.watch" in url.lower():
+                err_text = f"⚠️ Maaf, tidak dapat mengekstrak media dari link Facebook ini (konten mungkin bersifat privat, telah dihapus, atau memerlukan login Facebook). Link asli: {url}"
+                if status_msg:
+                    await status_msg.edit_text(err_text)
+                else:
+                    await message.reply_text(err_text)
             else:
                 err_text = f"⚠️ Maaf, tidak dapat mengekstrak media dari link ini: {url}"
                 if status_msg:
