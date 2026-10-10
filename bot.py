@@ -4,6 +4,7 @@ Telegram media-relay bot — ZERO-DOWNLOAD with intelligent Buffer Fallback, aut
 
 import asyncio
 import html
+import http.cookiejar
 import io
 import json
 import logging
@@ -257,14 +258,16 @@ def parse_cookie_input(raw: str) -> str | None:
                 cookies_dict[k] = v
 
     # Case 3: Raw sessionid format (e.g. 37543624797%3AmTraJsc... or 37543624797:mTraJsc...)
-    if "sessionid" not in cookies_dict:
+    if "sessionid" not in cookies_dict and "c_user" not in cookies_dict:
         m = re.search(r"(\d+(?:%3A|:)[a-zA-Z0-9_%:-]{20,})", text)
         if m:
             cookies_dict["sessionid"] = m.group(1)
         elif len(text) > 30 and not " " in text and not text.startswith("http"):
             cookies_dict["sessionid"] = text
 
-    if not cookies_dict.get("sessionid"):
+    has_ig = bool(cookies_dict.get("sessionid"))
+    has_fb = bool(cookies_dict.get("c_user") or cookies_dict.get("xs"))
+    if not has_ig and not has_fb:
         return None
 
     now = int(time.time())
@@ -276,22 +279,16 @@ def parse_cookie_input(raw: str) -> str | None:
     ]
 
     # Auto-extract ds_user_id from sessionid if not provided
-    if "ds_user_id" not in cookies_dict:
+    if has_ig and "ds_user_id" not in cookies_dict:
         m_uid = re.match(r"^(\d+)", cookies_dict["sessionid"])
         if m_uid:
             cookies_dict["ds_user_id"] = m_uid.group(1)
 
-    if "csrftoken" not in cookies_dict:
-        cookies_dict["csrftoken"] = "en8mweL8euBCrh8YeGsWBkmg"
-    if "ig_did" not in cookies_dict:
-        cookies_dict["ig_did"] = "D3F2156A-F912-4EAD-B8DD-22E99168CFE2"
-    if "ig_nrcb" not in cookies_dict:
-        cookies_dict["ig_nrcb"] = "1"
-    if "mid" not in cookies_dict:
-        cookies_dict["mid"] = "anAH6QALAAGeF6fK6oHA3hrwVx1T"
-
     for k, v in cookies_dict.items():
-        lines.append(f".instagram.com\tTRUE\t/\tTRUE\t{expires}\t{k}\t{v}")
+        if k in ("c_user", "xs", "datr", "sb", "fr"):
+            lines.append(f".facebook.com\tTRUE\t/\tTRUE\t{expires}\t{k}\t{v}")
+        else:
+            lines.append(f".instagram.com\tTRUE\t/\tTRUE\t{expires}\t{k}\t{v}")
 
     return "\n".join(lines)
 
@@ -515,7 +512,8 @@ def test_and_save_user_cookies(user_id: int, username: str, raw_text: str) -> bo
             return True
         else:
             log.warning("yt-dlp test failed for user %s (code %s): %s", user_id, res.returncode, (res.stderr or res.stdout).strip()[:300])
-            if "sessionid" in parsed_netscape:
+            has_valid_cookie_keys = any(k in parsed_netscape for k in ["sessionid", "c_user", "xs"])
+            if has_valid_cookie_keys:
                 log.info("Saving cookies anyway for user %s as fallback", user_id)
                 DB.execute(
                     "INSERT OR REPLACE INTO user_cookies (user_id, username, cookie_text, is_valid, is_enabled, updated_at) VALUES (?, ?, ?, 1, 1, ?)",
@@ -532,7 +530,8 @@ def test_and_save_user_cookies(user_id: int, username: str, raw_text: str) -> bo
                 os.remove(temp_path)
             except OSError:
                 pass
-        if "sessionid" in parsed_netscape:
+        has_valid_cookie_keys = any(k in parsed_netscape for k in ["sessionid", "c_user", "xs"])
+        if has_valid_cookie_keys:
             log.info("Saving cookies anyway for user %s after exception fallback", user_id)
             DB.execute(
                 "INSERT OR REPLACE INTO user_cookies (user_id, username, cookie_text, is_valid, is_enabled, updated_at) VALUES (?, ?, ?, 1, 1, ?)",
@@ -580,6 +579,18 @@ def get_user_cookie_status(user_id: int) -> dict:
 
 def has_active_cookies() -> bool:
     return os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 20
+
+
+def get_loaded_cookiejar() -> http.cookiejar.MozillaCookieJar | None:
+    """Load MozillaCookieJar from active cookies file if present."""
+    if has_active_cookies():
+        try:
+            cj = http.cookiejar.MozillaCookieJar(COOKIES_FILE_PATH)
+            cj.load(ignore_discard=True, ignore_expires=True)
+            return cj
+        except Exception as e:
+            log.warning("Could not load MozillaCookieJar: %s", e)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1018,7 @@ def extract_reddit(url: str) -> dict | None:
 
 def ytdlp_extract(url: str, use_cookies: bool = True) -> dict | None:
     is_ig = "instagram.com" in url.lower()
+    is_fb = "facebook.com" in url.lower() or "fb.watch" in url.lower()
     is_yt = "youtube.com" in url.lower() or "youtu.be" in url.lower()
     clean_target = url
 
@@ -1023,12 +1035,12 @@ def ytdlp_extract(url: str, use_cookies: bool = True) -> dict | None:
     cmd = ["yt-dlp", "-j", "--no-playlist", "--no-warnings"]
     if is_yt:
         cmd.extend(["--extractor-args", "youtube:player_client=default,ios"])
-    # Only supply cookies if URL is Instagram (where user cookies belong)
-    if use_cookies and has_active_cookies() and is_ig:
+    # Supply cookies if URL is Instagram or Facebook (where user cookies belong)
+    if use_cookies and has_active_cookies() and (is_ig or is_fb):
         cmd.extend(["--cookies", COOKIES_FILE_PATH])
     cmd.append(clean_target)
 
-    log.info("Running yt-dlp (cookies=%s, is_yt=%s) for %s", bool(use_cookies and has_active_cookies() and is_ig), is_yt, clean_target)
+    log.info("Running yt-dlp (cookies=%s, is_yt=%s) for %s", bool(use_cookies and has_active_cookies() and (is_ig or is_fb)), is_yt, clean_target)
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=EXTRACT_TIMEOUT
@@ -1693,8 +1705,9 @@ def extract_facebook(url: str) -> dict | None:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
     }
+    cookies_jar = get_loaded_cookiejar()
     try:
-        resp = HTTP_SESSION.get(clean_url, headers=headers, allow_redirects=True, timeout=EXTRACT_TIMEOUT)
+        resp = HTTP_SESSION.get(clean_url, headers=headers, cookies=cookies_jar, allow_redirects=True, timeout=EXTRACT_TIMEOUT)
         if resp.status_code != 200:
             log.warning("Facebook request returned status %d for %s", resp.status_code, clean_url)
             return None
