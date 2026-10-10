@@ -68,7 +68,7 @@ WORKER_BASE_URL = os.environ.get("WORKER_BASE_URL", "https://tg-relay.sandhyaras
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/data/cache.db")
 COOKIES_FILE_PATH = os.environ.get("COOKIES_FILE_PATH", "/data/cookies.txt")
-MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
+MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 49 * 1024 * 1024))
 EXTRACT_TIMEOUT = int(os.environ.get("EXTRACT_TIMEOUT", 30))
 COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 0.0))
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
@@ -813,7 +813,7 @@ def extract_tiktok(url: str) -> dict | None:
         for ep in endpoints:
             try:
                 log.info("Querying TikTok via TikWM (%s) for %s", ep, candidate_url)
-                resp = HTTP_SESSION.post(ep, data={"url": candidate_url}, timeout=25)
+                resp = HTTP_SESSION.post(ep, data={"url": candidate_url}, timeout=10)
                 if resp.status_code == 200:
                     res_json = resp.json()
                     if res_json.get("code") == 0:
@@ -3457,13 +3457,16 @@ async def download_and_send_via_ytdlp(
 
     actual_file = None
     try:
-        # Format selector: try 720p, 480p, 360p, 240p merged to mp4 (WITHOUT --max-filesize which causes fatal aborted .part files)
+        # Format selector: prioritize compact, fast-upload formats (720p/480p/360p) to minimize home Wi-Fi upload load
         format_spec = (
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=720][filesize<25M][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=720][filesize_approx<25M]+bestaudio/"
+            "bestvideo[height<=480]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=480]+bestaudio/"
+            "best[height<=720][filesize<25M]/"
+            "best[height<=480]/"
             "bestvideo[height<=720]+bestaudio/"
             "best[height<=720]/"
-            "bestvideo[height<=480]+bestaudio/"
-            "best[height<=480]/"
             "bestvideo[height<=360]+bestaudio/"
             "best[height<=360]/"
             "best"
@@ -3776,9 +3779,12 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode=pm,
                             supports_streaming=True,
                         ))
-                
                 try:
-                    sent_msgs = await message.reply_media_group(media=media_list)
+                    sent_msgs = await message.reply_media_group(
+                        media=media_list,
+                        read_timeout=90.0,
+                        write_timeout=90.0,
+                    )
                     cache_items = []
                     for sm in sent_msgs:
                         if sm.photo:
@@ -3849,12 +3855,14 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
         platform = detect_platform_name(url)
         is_youtube = platform == "youtube"
 
-        direct = pick_direct_url(info) if not is_youtube else None
+        # Try to find a direct progressive stream (including YouTube progressive formats like format 18)
+        direct = pick_direct_url(info)
         filesize = direct.get("filesize") if direct else None
 
-        # Check if direct relay is not suitable (YouTube, >20MB, or separate DASH streams)
-        if is_youtube or direct is None or (filesize and filesize > 20 * 1024 * 1024):
-            log.info("Direct relay URL not suitable (is_yt=%s, direct=%s, size=%s). Trying yt-dlp downloader for %s", is_youtube, direct is not None, filesize, url)
+        # Check if direct relay is suitable (progressive stream exists and <= MAX_RELAY_BYTES)
+        # If direct is None (e.g. YouTube DASH video requiring audio/video merge) or exceeds MAX_RELAY_BYTES: fallback to yt-dlp
+        if direct is None or (filesize and filesize > MAX_RELAY_BYTES):
+            log.info("Direct relay not available (direct=%s, size=%s). Trying yt-dlp downloader for %s", direct is not None, filesize, url)
             success = await download_and_send_via_ytdlp(url, message, caption, status_msg, info=info)
             if success:
                 return
@@ -3896,7 +3904,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             media=relay_url,
                             caption=caption,
                             parse_mode=ParseMode.HTML,
-                        )
+                        ),
+                        read_timeout=60.0,
+                        write_timeout=60.0,
                     )
                     file_id = sent.photo[-1].file_id if sent.photo else ""
                     was_edited = True
@@ -3912,7 +3922,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             duration=duration,
                             thumbnail=thumb_input,
                             supports_streaming=True,
-                        )
+                        ),
+                        read_timeout=90.0,
+                        write_timeout=90.0,
                     )
                     file_id = sent.video.file_id if sent.video else (sent.document.file_id if sent.document else "")
                     was_edited = True
@@ -3927,7 +3939,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             height=height,
                             duration=duration,
                             thumbnail=thumb_input,
-                        )
+                        ),
+                        read_timeout=90.0,
+                        write_timeout=90.0,
                     )
                     file_id = sent.animation.file_id if sent.animation else (sent.document.file_id if sent.document else "")
                     was_edited = True
@@ -3947,6 +3961,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                         height=height,
                         duration=duration,
                         thumbnail=thumb_input,
+                        read_timeout=90.0,
+                        write_timeout=90.0,
                     )
                     file_id = sent.animation.file_id if sent.animation else (sent.document.file_id if sent.document else "")
                 elif kind == "video":
@@ -3959,6 +3975,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                         duration=duration,
                         thumbnail=thumb_input,
                         supports_streaming=True,
+                        read_timeout=90.0,
+                        write_timeout=90.0,
                     )
                     file_id = sent.video.file_id if sent.video else (sent.document.file_id if sent.document else "")
                 else:
@@ -3966,6 +3984,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                         photo=relay_url,
                         caption=caption,
                         parse_mode=ParseMode.HTML,
+                        read_timeout=60.0,
+                        write_timeout=60.0,
                     )
                     file_id = sent.photo[-1].file_id if sent.photo else ""
             except Exception as e:
