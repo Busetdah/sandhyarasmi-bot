@@ -608,7 +608,7 @@ def detect_platform_name(url: str) -> str:
         return "reddit"
     elif "threads.net" in url_lower or "threads.com" in url_lower:
         return "threads"
-    elif "twitter.com" in url_lower or "x.com" in url_lower:
+    elif any(k in url_lower for k in ["twitter.com", "x.com", "fxtwitter.com", "vxtwitter.com", "fixupx.com"]):
         return "twitter"
     elif "pinterest.com" in url_lower or "pin.it" in url_lower:
         return "pinterest"
@@ -656,6 +656,30 @@ def clean_metadata_fields(info: dict, url: str) -> tuple[str, str]:
                 else:
                     uploader = parts[-1]
             break
+
+    # 1b. Handle Facebook author - title pattern: "Author - Description" or "Author | Description"
+    if "facebook.com" in url.lower() or "fb.watch" in url.lower() or detect_platform_name(url) == "facebook":
+        if title:
+            if uploader and title.startswith(f"{uploader} - "):
+                title = title[len(uploader) + 3:].strip()
+            elif uploader and title.startswith(f"{uploader} | "):
+                title = title[len(uploader) + 3:].strip()
+            elif not uploader:
+                if desc and desc in title:
+                    prefix = title.replace(desc, "").strip().strip("-|•").strip()
+                    if prefix and len(prefix) < 80 and "\n" not in prefix:
+                        uploader = prefix
+                        title = desc
+                elif " - " in title:
+                    parts = title.split(" - ", 1)
+                    if len(parts[0]) < 80 and "\n" not in parts[0]:
+                        uploader = parts[0].strip()
+                        title = parts[1].strip()
+                elif " | " in title:
+                    parts = title.split(" | ", 1)
+                    if len(parts[0]) < 80 and "\n" not in parts[0]:
+                        uploader = parts[0].strip()
+                        title = parts[1].strip()
 
     # 2. Strip generic stats / views from uploader
     if uploader and any(k in uploader.lower() for k in ["views", "reactions", "likes", "subscribers", "followers"]):
@@ -932,12 +956,29 @@ def extract_reddit(url: str) -> dict | None:
 
 
 def ytdlp_extract(url: str, use_cookies: bool = True) -> dict | None:
-    cmd = ["yt-dlp", "-j", "--no-playlist", "--no-warnings"]
-    if use_cookies and has_active_cookies():
-        cmd.extend(["--cookies", COOKIES_FILE_PATH])
-    cmd.append(url)
+    is_ig = "instagram.com" in url.lower()
+    is_yt = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    clean_target = url
 
-    log.info("Running yt-dlp (cookies=%s) for %s", bool(use_cookies and has_active_cookies()), url)
+    if is_yt:
+        m_short = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]+)", clean_target)
+        if m_short:
+            clean_target = f"https://www.youtube.com/watch?v={m_short.group(1)}"
+        else:
+            clean_target = re.sub(r"[?&](?:si|list|start_radio|index)=[^&]*", "", clean_target)
+            if "?" not in clean_target and "&" in clean_target:
+                clean_target = clean_target.replace("&", "?", 1)
+            clean_target = clean_target.rstrip("?&")
+
+    cmd = ["yt-dlp", "-j", "--no-playlist", "--no-warnings"]
+    if is_yt:
+        cmd.extend(["--extractor-args", "youtube:player_client=default,ios"])
+    # Only supply cookies if URL is Instagram (where user cookies belong)
+    if use_cookies and has_active_cookies() and is_ig:
+        cmd.extend(["--cookies", COOKIES_FILE_PATH])
+    cmd.append(clean_target)
+
+    log.info("Running yt-dlp (cookies=%s, is_yt=%s) for %s", bool(use_cookies and has_active_cookies() and is_ig), is_yt, clean_target)
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=EXTRACT_TIMEOUT
@@ -1140,10 +1181,11 @@ def is_avatar_url(u: str) -> bool:
     if any(k in u_lower for k in [
         "/rsrc.php", "static.", "profile_pic", "avatar",
         "-19/", "t51.82787-19", "t51.2885-19", "t39.92108-6",
-        "profile_picture", "profilepic", "/identity/"
+        "profile_picture", "profilepic", "/identity/",
+        "profile_images", "abs.twimg.com", "default_profile", "twimg.com/sticky"
     ]):
         return True
-    if re.search(r"s\d+x\d+", u_lower):  # e.g. s50x50, s100x100, s150x150, s320x320, s640x640
+    if re.search(r"[sp]\d+x\d+", u_lower):  # e.g. s50x50, s100x100, s150x150, s320x320, s640x640, p50x50, p100x100
         return True
     return False
 
@@ -1449,16 +1491,32 @@ def extract_threads(url: str) -> dict | None:
 
 def og_scrape_fallback(url: str) -> dict | None:
     log.info("Running OG-scrape fallback for %s", url)
+    is_fb = any(k in url.lower() for k in ["facebook.com", "fb.watch"])
     headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "User-Agent": "Twitterbot/1.0" if is_fb else "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     try:
         resp = HTTP_SESSION.get(url, headers=headers, timeout=EXTRACT_TIMEOUT)
+        if resp.status_code == 404:
+            log.info("OG-scrape returned 404 for %s", url)
+            return {
+                "_kind": "text",
+                "title": "⚠️ Halaman Tidak Ditemukan (404)",
+                "description": "Halaman atau postingan dari tautan ini sudah dihapus atau tidak tersedia.",
+                "uploader": "",
+            }
         resp.raise_for_status()
     except requests.RequestException as e:
         log.info("OG-scrape fetch failed for %s: %s", url, e)
+        if hasattr(e, "response") and e.response is not None and e.response.status_code == 404:
+            return {
+                "_kind": "text",
+                "title": "⚠️ Halaman Tidak Ditemukan (404)",
+                "description": "Halaman atau postingan dari tautan ini sudah dihapus atau tidak tersedia.",
+                "uploader": "",
+            }
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -1469,8 +1527,20 @@ def og_scrape_fallback(url: str) -> dict | None:
 
     video_url = meta("og:video:secure_url") or meta("og:video") or meta("twitter:player:stream")
     image_url = meta("og:image:secure_url") or meta("og:image") or meta("twitter:image")
-    og_title = meta("og:title") or meta("twitter:title") or ""
-    og_desc = meta("og:description") or meta("twitter:description") or ""
+    og_title = meta("og:title") or meta("twitter:title") or (soup.title.string.strip() if soup.title and soup.title.string else "")
+    og_desc = meta("og:description") or meta("twitter:description") or meta("description") or ""
+
+    # Detect deleted / not found pages across platforms
+    low_title = (og_title or "").lower()
+    low_desc = (og_desc or "").lower()
+    if any(k in low_title or k in low_desc for k in ["post not found", "404 error", "page not found", "halaman tidak ditemukan", "konten ini tidak tersedia", "tidak dapat menemukan halaman"]):
+        log.info("OG-scrape detected 404/deleted content for %s", url)
+        return {
+            "_kind": "text",
+            "title": "⚠️ Postingan Tidak Ditemukan",
+            "description": "Konten atau postingan dari tautan ini sudah dihapus atau tidak tersedia.",
+            "uploader": "",
+        }
 
     caption = og_desc or og_title
     uploader = ""
@@ -1520,6 +1590,386 @@ def og_scrape_fallback(url: str) -> dict | None:
     return None
 
 
+def extract_facebook(url: str) -> dict | None:
+    """Extract Facebook media (video, reels, photo, album, or text) via yt-dlp & OpenGraph scraper."""
+    clean_url = url.strip()
+    is_video_hint = any(k in clean_url.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/"])
+
+    # 1. If it's explicitly a video/reel URL, try yt-dlp first
+    if is_video_hint:
+        try:
+            info = ytdlp_extract(clean_url)
+            if info is not None:
+                if info.get("_kind") != "album":
+                    info["_kind"] = "photo" if info.get("ext") in ("jpg", "jpeg", "png", "webp") else "video"
+                log.info("Facebook video extracted via direct yt-dlp for %s", clean_url)
+                return info
+        except Exception as e:
+            log.debug("Facebook initial yt-dlp attempt error: %s", e)
+
+    # 2. Fetch page with Twitterbot headers to get OpenGraph & canonical URL
+    # Note: facebookexternalhit user-agent causes Facebook to strip og:image on its own URLs!
+    # Twitterbot/1.0 headers reliably prompt Facebook to return og:image, og:video, og:title, and og:url.
+    headers = {
+        "User-Agent": "Twitterbot/1.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    try:
+        resp = HTTP_SESSION.get(clean_url, headers=headers, allow_redirects=True, timeout=EXTRACT_TIMEOUT)
+        if resp.status_code != 200:
+            log.warning("Facebook request returned status %d for %s", resp.status_code, clean_url)
+            return None
+        html_text = resp.text
+    except Exception as e:
+        log.warning("Facebook request failed for %s: %s", clean_url, e)
+        return None
+
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    def meta(prop):
+        tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+        return tag["content"] if tag and tag.get("content") else None
+
+    og_url = meta("og:url") or clean_url
+    og_title = meta("og:title") or meta("twitter:title") or ""
+    og_desc = meta("og:description") or meta("twitter:description") or meta("description") or ""
+
+    uploader = ""
+    if og_title:
+        og_title = html.unescape(og_title).strip()
+    if og_desc:
+        og_desc = html.unescape(og_desc).strip()
+
+    if og_title:
+        if og_desc and og_desc in og_title:
+            prefix = og_title.replace(og_desc, "").strip().strip("-|•").strip()
+            if prefix and len(prefix) < 80 and "\n" not in prefix:
+                uploader = prefix
+        elif " - " in og_title:
+            parts = og_title.split(" - ", 1)
+            if len(parts[0]) < 80 and "\n" not in parts[0]:
+                uploader = parts[0].strip()
+        elif " | " in og_title:
+            parts = og_title.split(" | ", 1)
+            if len(parts[0]) < 80 and "\n" not in parts[0]:
+                uploader = parts[0].strip()
+
+    caption = og_desc or og_title
+
+    # 3. If og_url points to a canonical reel or watch video and we haven't tried yt-dlp on it yet:
+    if og_url and og_url != clean_url and any(k in og_url.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/"]):
+        try:
+            info = ytdlp_extract(og_url)
+            if info is not None:
+                if info.get("_kind") != "album":
+                    info["_kind"] = "photo" if info.get("ext") in ("jpg", "jpeg", "png", "webp") else "video"
+                log.info("Facebook video extracted via canonical yt-dlp (%s) for %s", og_url, clean_url)
+                return info
+        except Exception as e:
+            log.debug("Facebook canonical yt-dlp attempt error: %s", e)
+
+    # 4. Check for direct video tags
+    video_url = meta("og:video:secure_url") or meta("og:video") or meta("twitter:player:stream")
+    if video_url:
+        if not any(k in video_url.lower() for k in ["/rsrc.php", "static."]):
+            clean_video_url = html.unescape(video_url).replace("&amp;", "&")
+            thumb_url = meta("og:image:secure_url") or meta("og:image") or meta("twitter:image")
+            if thumb_url:
+                thumb_url = html.unescape(thumb_url).replace("&amp;", "&")
+            log.info("Facebook video extracted via OpenGraph meta for %s", clean_url)
+            return {
+                "formats": [],
+                "url": clean_video_url,
+                "thumbnail": thumb_url,
+                "ext": "mp4",
+                "filesize": None,
+                "title": caption,
+                "description": caption,
+                "uploader": uploader,
+                "_kind": "video",
+            }
+
+    # 5. Collect all image tags (OpenGraph, <img> elements, and full-resolution script matches)
+    image_tags = soup.find_all("meta", property="og:image") or soup.find_all("meta", attrs={"name": "og:image"})
+    if not image_tags:
+        image_tags = soup.find_all("meta", property="og:image:secure_url") or soup.find_all("meta", attrs={"name": "twitter:image"})
+
+    image_urls = []
+    seen_images = set()
+
+    def add_image_candidate(u: str):
+        if not u:
+            return
+        clean = html.unescape(u).replace(r'\/', '/').replace('&amp;', '&').replace(r'\u0026', '&').strip()
+        if not clean.startswith("http"):
+            return
+        if any(k in clean.lower() for k in ["/rsrc.php", "static.", "favicon", ".webp", "emoji"]):
+            return
+        if is_avatar_url(clean):
+            return
+        # Normalize base filename to avoid duplicate URLs of different CDN query strings
+        base_match = re.search(r'(/[^/?#]+\.(?:jpg|jpeg|png))', clean)
+        base_key = base_match.group(1) if base_match else clean.split('?')[0]
+        if base_key not in seen_images:
+            seen_images.add(base_key)
+            image_urls.append(clean)
+
+    for tag in image_tags:
+        add_image_candidate(tag.get("content"))
+
+    # Also check <img> tags for post photos
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if src and "fbcdn.net" in src.lower() and any(k in src for k in ["/t39.", "/t1.", "/t31.", "/v/t"]):
+            add_image_candidate(src)
+
+    # In case of carousel / multi-photo posts where only 1 og:image is present,
+    # scan HTML and script payload for additional full-res photo URLs
+    if len(image_urls) <= 1:
+        script_matches = re.findall(
+            r'https:(?:\\/\\/|//)[a-zA-Z0-9.-]+\.fbcdn\.net(?:\\/|/)v(?:\\/|/)t[0-9.]+-6(?:\\/|/)[^"\'\s<>]+\.(?:jpg|jpeg|png)[^"\'\s<>]*',
+            html_text
+        )
+        for sm in script_matches:
+            add_image_candidate(sm)
+
+    if len(image_urls) > 1:
+        log.info("Facebook album extracted with %d images for %s", len(image_urls), clean_url)
+        return {
+            "_kind": "album",
+            "items": [{"url": u, "kind": "photo"} for u in image_urls[:10]],
+            "title": caption,
+            "description": caption,
+            "uploader": uploader,
+        }
+    elif len(image_urls) == 1:
+        log.info("Facebook photo extracted for %s: %s", clean_url, image_urls[0][:80])
+        return {
+            "formats": [],
+            "url": image_urls[0],
+            "ext": "jpg",
+            "filesize": None,
+            "title": caption,
+            "description": caption,
+            "uploader": uploader,
+            "_kind": "photo",
+        }
+
+    # 6. Fallback to general yt-dlp if not tried yet
+    if not is_video_hint:
+        try:
+            info = ytdlp_extract(clean_url)
+            if info is not None:
+                if info.get("_kind") != "album":
+                    info["_kind"] = "photo" if info.get("ext") in ("jpg", "jpeg", "png", "webp") else "video"
+                log.info("Facebook extracted via fallback yt-dlp for %s", clean_url)
+                return info
+        except Exception:
+            pass
+
+    # 7. Text-only fallback if title or description exists
+    if caption:
+        log.info("Facebook text-only post extracted for %s", clean_url)
+        return {
+            "_kind": "text",
+            "title": og_title or caption,
+            "description": og_desc or caption,
+            "uploader": uploader,
+        }
+
+    return None
+
+
+def extract_twitter(url: str) -> dict | None:
+    """Extract Twitter / X posts (videos, animations, photos, multi-photo albums, and text-only posts)
+    using FxTwitter / VxTwitter public APIs with yt-dlp fallback.
+    """
+    clean_url = url.strip()
+    m_id = re.search(r"(?:twitter\.com|x\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com)/(?:[^/]+/status/|status/|i/status/)(\d+)", clean_url)
+    if not m_id:
+        return None
+    status_id = m_id.group(1)
+
+    m_user = re.search(r"(?:twitter\.com|x\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com)/([A-Za-z0-9_]+)/status/", clean_url)
+    user = m_user.group(1) if m_user and m_user.group(1).lower() not in ("i", "status") else "Twitter"
+
+    # 1. Primary: Query FxTwitter API (fast, robust, structured JSON)
+    try:
+        fx_url = f"https://api.fxtwitter.com/{user}/status/{status_id}"
+        log.info("Querying Twitter via FxTwitter API: %s", fx_url)
+        resp = HTTP_SESSION.get(fx_url, headers={"User-Agent": "TelegramBot (like TwitterBot)"}, timeout=EXTRACT_TIMEOUT)
+        if resp.status_code == 404:
+            log.info("Twitter post 404 Not Found on FxTwitter: %s", clean_url)
+            return {
+                "_kind": "text",
+                "title": "⚠️ Postingan Tidak Ditemukan",
+                "description": "Postingan X (Twitter) ini sudah dihapus oleh pemiliknya, akun di-private/suspend, atau link tidak tersedia.",
+                "uploader": f"@{user}" if user != "Twitter" else "",
+            }
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 404:
+                return {
+                    "_kind": "text",
+                    "title": "⚠️ Postingan Tidak Ditemukan",
+                    "description": "Postingan X (Twitter) ini sudah dihapus oleh pemiliknya, akun di-private/suspend, atau link tidak tersedia.",
+                    "uploader": f"@{user}" if user != "Twitter" else "",
+                }
+            tweet = data.get("tweet")
+            if tweet:
+                author = tweet.get("author") or {}
+                screen_name = author.get("screen_name") or user
+                uploader = f"@{screen_name}" if screen_name and screen_name != "Twitter" else ""
+                text = (tweet.get("text") or "").strip()
+
+                # Handle quote tweet
+                quote_data = tweet.get("quote")
+                if quote_data:
+                    q_user = quote_data.get("author", {}).get("screen_name") or ""
+                    q_text = (quote_data.get("text") or "").strip()
+                    if q_user and q_text:
+                        quote_block = f"💬 Mengutip @{q_user}:\n{q_text}"
+                        text = f"{text}\n\n{quote_block}" if text else quote_block
+
+                media = tweet.get("media") or {}
+                all_media = media.get("all") or []
+
+                if len(all_media) > 1:
+                    items = []
+                    for it in all_media:
+                        itype = it.get("type", "photo")
+                        ikind = "video" if itype in ("video", "gif") else "photo"
+                        iurl = it.get("url")
+                        if iurl:
+                            items.append({"url": iurl, "kind": ikind})
+                    if items:
+                        log.info("Twitter album extracted with %d items for %s", len(items), clean_url)
+                        return {
+                            "_kind": "album",
+                            "items": items,
+                            "title": text,
+                            "description": text,
+                            "uploader": uploader,
+                        }
+
+                elif len(all_media) == 1:
+                    item = all_media[0]
+                    itype = item.get("type", "photo")
+                    iurl = item.get("url")
+                    if itype in ("video", "gif"):
+                        thumb = item.get("thumbnail_url")
+                        duration = item.get("duration")
+                        log.info("Twitter %s extracted for %s", itype, clean_url)
+                        return {
+                            "formats": [],
+                            "url": iurl,
+                            "thumbnail": thumb,
+                            "duration": duration,
+                            "ext": "mp4",
+                            "filesize": None,
+                            "title": text,
+                            "description": text,
+                            "uploader": uploader,
+                            "_kind": "animation" if itype == "gif" else "video",
+                        }
+                    else:
+                        log.info("Twitter single photo extracted for %s", clean_url)
+                        return {
+                            "formats": [],
+                            "url": iurl,
+                            "ext": "jpg",
+                            "filesize": None,
+                            "title": text,
+                            "description": text,
+                            "uploader": uploader,
+                            "_kind": "photo",
+                        }
+
+                # Text-only tweet
+                log.info("Twitter text-only post extracted for %s", clean_url)
+                return {
+                    "_kind": "text",
+                    "title": text,
+                    "description": text,
+                    "uploader": uploader,
+                }
+    except Exception as e_fx:
+        log.warning("FxTwitter API error for %s: %s", clean_url, e_fx)
+
+    # 2. Secondary: Query VxTwitter API
+    try:
+        vx_url = f"https://api.vxtwitter.com/Twitter/status/{status_id}"
+        log.info("Querying Twitter via VxTwitter fallback: %s", vx_url)
+        resp_vx = HTTP_SESSION.get(vx_url, headers={"User-Agent": "TelegramBot"}, timeout=EXTRACT_TIMEOUT)
+        if resp_vx.status_code == 200 and "application/json" in resp_vx.headers.get("content-type", ""):
+            vx_data = resp_vx.json()
+            vx_user = vx_data.get("user_screen_name") or user
+            uploader = f"@{vx_user}" if vx_user and vx_user != "Twitter" else ""
+            text = (vx_data.get("text") or "").strip()
+
+            qrt = vx_data.get("qrt")
+            if qrt and qrt.get("user_screen_name") and qrt.get("text"):
+                quote_block = f"💬 Mengutip @{qrt['user_screen_name']}:\n{qrt['text'].strip()}"
+                text = f"{text}\n\n{quote_block}" if text else quote_block
+
+            vx_media = vx_data.get("media_extended") or []
+            if len(vx_media) > 1:
+                items = []
+                for m in vx_media:
+                    k = "video" if m.get("type") in ("video", "gif") else "photo"
+                    if m.get("url"):
+                        items.append({"url": m["url"], "kind": k})
+                if items:
+                    return {
+                        "_kind": "album",
+                        "items": items,
+                        "title": text,
+                        "description": text,
+                        "uploader": uploader,
+                    }
+            elif len(vx_media) == 1:
+                m = vx_media[0]
+                k = "video" if m.get("type") in ("video", "gif") else "photo"
+                return {
+                    "formats": [],
+                    "url": m["url"],
+                    "thumbnail": m.get("thumbnail_url"),
+                    "ext": "mp4" if k == "video" else "jpg",
+                    "filesize": None,
+                    "title": text,
+                    "description": text,
+                    "uploader": uploader,
+                    "_kind": k,
+                }
+            elif text:
+                return {
+                    "_kind": "text",
+                    "title": text,
+                    "description": text,
+                    "uploader": uploader,
+                }
+        elif resp_vx.status_code == 404 or "Failed to scan your link" in resp_vx.text:
+            return {
+                "_kind": "text",
+                "title": "⚠️ Postingan Tidak Ditemukan",
+                "description": "Postingan X (Twitter) ini sudah dihapus oleh pemiliknya, akun di-private/suspend, atau link tidak tersedia.",
+                "uploader": f"@{user}" if user != "Twitter" else "",
+            }
+    except Exception as e_vx:
+        log.warning("VxTwitter fallback error for %s: %s", clean_url, e_vx)
+
+    # 3. Tertiary: Fallback to yt-dlp
+    try:
+        info = ytdlp_extract(clean_url)
+        if info:
+            return info
+    except Exception:
+        pass
+
+    return None
+
+
 def extract_info(url: str) -> dict | None:
     if "tiktok.com" in url.lower():
         tt_info = extract_tiktok(url)
@@ -1540,6 +1990,16 @@ def extract_info(url: str) -> dict | None:
         ig_info = extract_instagram(url)
         if ig_info:
             return ig_info
+
+    if "facebook.com" in url.lower() or "fb.watch" in url.lower():
+        fb_info = extract_facebook(url)
+        if fb_info:
+            return fb_info
+
+    if any(k in url.lower() for k in ["twitter.com", "x.com", "fxtwitter.com", "vxtwitter.com", "fixupx.com"]):
+        tw_info = extract_twitter(url)
+        if tw_info:
+            return tw_info
 
     info = ytdlp_extract(url)
     if info is not None:
@@ -1697,7 +2157,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🤖 **Reddit** (`video`, `animasi GIF`, `gallery`, `post teks`)\n"
         "• 🧵 **Threads** (`post`, `multi-images`)\n"
         "• 🐦 **X / Twitter** (`x.com`)\n"
-        "• 📘 **Facebook** (`video`, `reels`)\n\n"
+        "• 📘 **Facebook** (`video`, `reels`, `photo`, `album`)\n\n"
         "👇 **Gunakan tombol di bawah untuk melihat menu dan panduan:**"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard())
@@ -2432,7 +2892,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "• 🤖 **Reddit** (`video`, `animasi GIF`, `gallery`, `post teks`)\n"
             "• 🧵 **Threads** (`post`, `multi-images`)\n"
             "• 🐦 **X / Twitter** (`x.com`)\n"
-            "• 📘 **Facebook** (`video`, `reels`)\n\n"
+            "• 📘 **Facebook** (`video`, `reels`, `photo`, `album`)\n\n"
             "👇 **Gunakan tombol di bawah untuk navigasi cepat:**"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard())
@@ -2806,14 +3266,18 @@ async def execute_pending_audio_download(session: dict, bot, status_msg=None):
         "--audio-quality", audio_quality,
         "-o", os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s"),
     ]
-    if has_active_cookies():
+    if has_active_cookies() and "instagram.com" in clean_target_url.lower():
         cmd_audio.extend(["--cookies", COOKIES_FILE_PATH])
+    if "youtube.com" in clean_target_url.lower() or "youtu.be" in clean_target_url.lower():
+        cmd_audio.extend(["--extractor-args", "youtube:player_client=default,ios"])
     cmd_audio.append(clean_target_url)
 
     log.info("Starting requested yt-dlp audio download for %s (quality=%s)", clean_target_url, audio_quality)
     actual_file = None
     try:
-        await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True, text=True, timeout=180)
+        proc_aud = await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True, text=True, timeout=180)
+        if proc_aud.returncode != 0:
+            log.warning("yt-dlp requested audio failed (code %d) for %s: %s", proc_aud.returncode, clean_target_url, proc_aud.stderr.strip()[-300:])
 
         for fn in os.listdir(temp_dir):
             if fn.startswith(f"dl_{temp_id}") and not fn.endswith((".part", ".ytdl", ".temp", ".tmp")):
@@ -2931,12 +3395,18 @@ async def download_and_send_via_ytdlp(
             pass
 
     # Clean playlist / radio parameters from YouTube URL if any
+    is_yt = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    is_ig = "instagram.com" in url.lower()
     clean_target_url = url
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        clean_target_url = re.sub(r"([?&])list=[^&]*", r"\1", clean_target_url)
-        clean_target_url = re.sub(r"([?&])start_radio=[^&]*", r"\1", clean_target_url)
-        clean_target_url = re.sub(r"([?&])index=[^&]*", r"\1", clean_target_url)
-        clean_target_url = clean_target_url.rstrip("&?").replace("?&", "?")
+    if is_yt:
+        m_short = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]+)", clean_target_url)
+        if m_short:
+            clean_target_url = f"https://www.youtube.com/watch?v={m_short.group(1)}"
+        else:
+            clean_target_url = re.sub(r"[?&](?:si|list|start_radio|index)=[^&]*", "", clean_target_url)
+            if "?" not in clean_target_url and "&" in clean_target_url:
+                clean_target_url = clean_target_url.replace("&", "?", 1)
+            clean_target_url = clean_target_url.rstrip("?&")
 
     temp_id = int(time.time() * 1000)
     temp_dir = os.environ.get("TEMP_DIR", "/app/temp")
@@ -3003,20 +3473,45 @@ async def download_and_send_via_ytdlp(
             "--no-playlist",
             "--no-warnings",
             "-N", "4",
-            "--concurrent-fragments", "4",
             "--buffer-size", "1024K",
-            "--http-chunk-size", "10M",
             "-f", format_spec,
             "--merge-output-format", "mp4",
             "-o", out_template,
         ]
-        if has_active_cookies():
+        if is_yt:
+            cmd_video.extend(["--extractor-args", "youtube:player_client=default,ios"])
+        else:
+            cmd_video.extend(["--concurrent-fragments", "4", "--http-chunk-size", "10M"])
+        if has_active_cookies() and is_ig:
             cmd_video.extend(["--cookies", COOKIES_FILE_PATH])
         cmd_video.append(clean_target_url)
 
         log.info("Starting yt-dlp video download for %s", clean_target_url)
-        await asyncio.to_thread(subprocess.run, cmd_video, capture_output=True, text=True, timeout=150)
+        proc_v = await asyncio.to_thread(subprocess.run, cmd_video, capture_output=True, text=True, timeout=150)
+        if proc_v.returncode != 0:
+            log.warning("yt-dlp video download returned code %d for %s: %s", proc_v.returncode, clean_target_url, proc_v.stderr.strip()[-300:])
         actual_file = find_completed_media(temp_dir, temp_id)
+
+        # General format fallback if primary format spec produced no file
+        if not actual_file:
+            log.info("yt-dlp primary video format failed, trying general format fallback for %s", clean_target_url)
+            cmd_fallback = [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "-f", "bestvideo+bestaudio/best",
+                "--merge-output-format", "mp4",
+                "-o", out_template,
+            ]
+            if is_yt:
+                cmd_fallback.extend(["--extractor-args", "youtube:player_client=default,ios"])
+            if has_active_cookies() and is_ig:
+                cmd_fallback.extend(["--cookies", COOKIES_FILE_PATH])
+            cmd_fallback.append(clean_target_url)
+            proc_fb = await asyncio.to_thread(subprocess.run, cmd_fallback, capture_output=True, text=True, timeout=150)
+            if proc_fb.returncode != 0:
+                log.warning("yt-dlp fallback download returned code %d for %s: %s", proc_fb.returncode, clean_target_url, proc_fb.stderr.strip()[-300:])
+            actual_file = find_completed_media(temp_dir, temp_id)
 
         # Check if downloaded video exceeds 50MB -> prompt user
         if actual_file and os.path.exists(actual_file):
@@ -3050,10 +3545,14 @@ async def download_and_send_via_ytdlp(
                 "--audio-quality", "128K",
                 "-o", os.path.join(temp_dir, f"dl_{temp_id}.%(ext)s"),
             ]
-            if has_active_cookies():
+            if is_yt:
+                cmd_audio.extend(["--extractor-args", "youtube:player_client=default,ios"])
+            if has_active_cookies() and is_ig:
                 cmd_audio.extend(["--cookies", COOKIES_FILE_PATH])
             cmd_audio.append(clean_target_url)
-            await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True, text=True, timeout=120)
+            proc_a = await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True, text=True, timeout=120)
+            if proc_a.returncode != 0:
+                log.warning("yt-dlp audio download returned code %d for %s: %s", proc_a.returncode, clean_target_url, proc_a.stderr.strip()[-300:])
             actual_file = find_completed_media(temp_dir, temp_id)
             if actual_file and os.path.getsize(actual_file) > 50 * 1024 * 1024:
                 size_mb = os.path.getsize(actual_file) / (1024 * 1024)
@@ -3486,6 +3985,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                 uploaded = False
                 try:
                     r = await asyncio.to_thread(HTTP_SESSION.get, relay_url, timeout=35)
+                    if (r.status_code != 200 or not r.content) and direct and direct.get("url"):
+                        log.info("Relay URL fetch failed (%d), falling back to direct URL fetch for %s", r.status_code, url)
+                        r = await asyncio.to_thread(HTTP_SESSION.get, direct["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=35)
                     if r.status_code == 200 and r.content:
                         thumb_file = None
                         if kind in ("video", "animation"):
