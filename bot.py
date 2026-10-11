@@ -348,7 +348,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo') OR (kind IN ('text', 'photo') AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%'))")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind IN ('photo', 'text')) OR (kind = 'text' AND (url LIKE '%/vt.%' OR url LIKE '%/vm.%' OR url LIKE '%tiktok.com%')) OR (kind IN ('text', 'photo') AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%'))")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     try:
@@ -890,31 +890,41 @@ def format_caption(info: dict, url: str) -> str:
 
 def extract_tiktok(url: str) -> dict | None:
     """Extract TikTok video or photo slides using TikWM API + yt-dlp fallback."""
-    urls_to_try = [url]
+    urls_to_try = []
     resolved_url = None
 
-    # Resolve short links (vt.tiktok.com, vm.tiktok.com) to avoid redirect timeouts on TikWM
-    if any(k in url.lower() for k in ["vt.tiktok.com", "vm.tiktok.com"]):
+    # Resolve short links (vt.tiktok.com, vm.tiktok.com, tiktok.com/t/) to avoid redirect timeouts on TikWM
+    if any(k in url.lower() for k in ["vt.tiktok.com", "vm.tiktok.com", "tiktok.com/t/"]):
         try:
             r = HTTP_SESSION.get(
                 url,
-                allow_redirects=True,
+                allow_redirects=False,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                timeout=12,
+                timeout=10,
             )
-            if r.status_code == 200 and r.url and r.url != url:
-                resolved_url = r.url
-                urls_to_try.append(resolved_url)
-                log.info("Resolved TikTok shortlink: %s -> %s", url, resolved_url)
+            loc = r.headers.get("Location") or r.headers.get("location")
+            if loc:
+                from urllib.parse import urljoin
+                loc = urljoin(url, loc)
+                resolved_url = loc
+                clean_loc = re.sub(r"\?.*$", "", loc)
+                if clean_loc not in urls_to_try:
+                    urls_to_try.append(clean_loc)
+                if loc not in urls_to_try:
+                    urls_to_try.append(loc)
+                log.info("Resolved TikTok shortlink via 301 Location: %s -> %s", url, loc)
         except Exception as e:
             log.debug("TikTok shortlink redirect error for %s: %s", url, e)
+
+    if url not in urls_to_try:
+        urls_to_try.append(url)
 
     endpoints = ["https://tikwm.com/api/", "https://www.tikwm.com/api/"]
 
     def _query_tikwm(ep: str, cand_url: str) -> dict | None:
         try:
             log.info("Querying TikTok via TikWM (%s) for %s", ep, cand_url)
-            resp = HTTP_SESSION.post(ep, data={"url": cand_url}, timeout=8)
+            resp = HTTP_SESSION.post(ep, data={"url": cand_url}, timeout=12)
             if resp.status_code == 200:
                 res_json = resp.json()
                 if res_json.get("code") == 0:
@@ -960,7 +970,7 @@ def extract_tiktok(url: str) -> dict | None:
         return None
 
     # Race endpoints concurrently across candidate URLs
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_req = {
             executor.submit(_query_tikwm, ep, cand_u): (ep, cand_u)
             for cand_u in urls_to_try
@@ -1699,6 +1709,10 @@ def og_scrape_fallback(url: str) -> dict | None:
             "_kind": "photo",
         }
     if og_title or og_desc:
+        # TikTok should never fallback to plain text if media extraction failed!
+        if any(k in url.lower() for k in ["tiktok.com", "vt.tiktok.com", "vm.tiktok.com"]):
+            log.warning("OG-scrape fallback rejected text-only result for TikTok: %s", url)
+            return None
         return {
             "_kind": "text",
             "title": og_title,
