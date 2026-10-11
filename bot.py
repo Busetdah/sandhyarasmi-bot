@@ -72,6 +72,7 @@ WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/data/cache.db")
 COOKIES_FILE_PATH = os.environ.get("COOKIES_FILE_PATH", "/data/cookies.txt")
 MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
+CACHE_RETENTION_DAYS = int(os.environ.get("CACHE_RETENTION_DAYS", "60"))
 EXTRACT_TIMEOUT = int(os.environ.get("EXTRACT_TIMEOUT", 30))
 COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 0.0))
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
@@ -350,7 +351,18 @@ def init_db():
         conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
+    try:
+        cutoff = time.time() - (CACHE_RETENTION_DAYS * 86400)
+        c = conn.execute("DELETE FROM cache WHERE created_at < ?", (cutoff,))
+        if c.rowcount > 0:
+            log.info("Purged %d cache entries older than %d days (2 months) on startup", c.rowcount, CACHE_RETENTION_DAYS)
+    except Exception as e:
+        log.warning("Failed to purge old cache on startup: %s", e)
     conn.commit()
+    try:
+        conn.execute("VACUUM")
+    except Exception as e:
+        log.debug("DB VACUUM note on startup: %s", e)
     return conn
 
 
@@ -626,6 +638,52 @@ def cache_set_album(url: str, items: list, caption: str | None = None):
         (url, "album", file_id_json, caption, time.time()),
     )
     DB.commit()
+
+
+def purge_old_cache(days: int = CACHE_RETENTION_DAYS) -> int:
+    """Purge cache entries older than specified days (default: 60 days / 2 months) and vacuum SQLite."""
+    cutoff = time.time() - (days * 86400)
+    try:
+        cursor = DB.execute("DELETE FROM cache WHERE created_at < ?", (cutoff,))
+        deleted_count = cursor.rowcount
+        DB.commit()
+        if deleted_count > 0:
+            log.info("Purged %d cache entries older than %d days (%d months)", deleted_count, days, max(1, days // 30))
+            try:
+                DB.execute("VACUUM")
+            except Exception as ve:
+                log.debug("DB VACUUM note: %s", ve)
+        return deleted_count
+    except Exception as e:
+        log.warning("Failed to purge old cache entries: %s", e)
+        return 0
+
+
+def clean_orphan_temp_files() -> int:
+    """Clean up orphan temp media files older than 1 hour in fast temp directories."""
+    dirs_to_check = []
+    if os.path.exists("/dev/shm/sandhyarasmi_temp"):
+        dirs_to_check.append("/dev/shm/sandhyarasmi_temp")
+    default_dir = os.path.join(tempfile.gettempdir(), "sandhyarasmi_temp")
+    if os.path.exists(default_dir):
+        dirs_to_check.append(default_dir)
+
+    now = time.time()
+    cleaned = 0
+    for d in dirs_to_check:
+        try:
+            for entry in os.scandir(d):
+                if entry.is_file() and (now - entry.stat().st_mtime) > 3600:
+                    try:
+                        os.remove(entry.path)
+                        cleaned += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug("Orphan temp cleanup note: %s", e)
+    if cleaned > 0:
+        log.info("Cleaned %d orphan temporary files from temp directories", cleaned)
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -2443,7 +2501,36 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.chat.type != ChatType.PRIVATE and not is_chat_allowed(message.chat.id, message.chat.type):
         return
     log.info("Received /ping from %s", update.effective_chat.id)
-    await message.reply_text("🏓 Pong! Bot aktif dan siap melayani.")
+    cache_count = 0
+    try:
+        row = DB.execute("SELECT COUNT(*) FROM cache").fetchone()
+        if row:
+            cache_count = row[0]
+    except Exception:
+        pass
+    await message.reply_text(
+        f"🏓 Pong! Bot aktif dan siap melayani.\n\n"
+        f"📦 Total Cache Aktif: {cache_count:,} media\n"
+        f"🧹 Auto-Purge: Otomatis dibersihkan jika > {CACHE_RETENTION_DAYS} hari (2 bulan)"
+    )
+
+
+async def purge_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not is_tester(user):
+        return
+    deleted = await asyncio.to_thread(purge_old_cache, CACHE_RETENTION_DAYS)
+    cleaned = await asyncio.to_thread(clean_orphan_temp_files)
+    row = DB.execute("SELECT COUNT(*) FROM cache").fetchone()
+    remaining = row[0] if row else 0
+    await message.reply_text(
+        f"🧹 **Pembersihan Cache Selesai!**\n\n"
+        f"🗑️ Dihapus: {deleted} item cache (> {CACHE_RETENTION_DAYS} hari)\n"
+        f"📁 File temp dibersihkan: {cleaned}\n"
+        f"📦 Sisa cache aktif: {remaining:,} media",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 def render_cookie_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -4421,6 +4508,20 @@ async def resend_cached(cached: dict, message, url: str, status_msg=None):
         await message.reply_text(f"(cache stale) Link asli: {url}")
 
 
+async def periodic_maintenance_task():
+    """Daily background maintenance: purge cache older than 60 days and clean orphan temp files."""
+    while True:
+        try:
+            await asyncio.sleep(24 * 3600)  # Wait 24 hours between runs
+            deleted_cache = await asyncio.to_thread(purge_old_cache, CACHE_RETENTION_DAYS)
+            cleaned_files = await asyncio.to_thread(clean_orphan_temp_files)
+            log.info("Daily maintenance completed (purged %d cache rows, cleaned %d temp files)", deleted_cache, cleaned_files)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Periodic maintenance background task error: %s", e)
+
+
 async def post_init(application: Application):
     """Set bot commands list on Telegram."""
     commands = [
@@ -4436,6 +4537,9 @@ async def post_init(application: Application):
         log.info("Registered Telegram bot commands successfully.")
     except Exception as e:
         log.warning("Failed to set bot commands: %s", e)
+
+    # Launch daily background maintenance task (auto-purge 60 days + orphan temp cleanup)
+    asyncio.create_task(periodic_maintenance_task())
 
 
 # ---------------------------------------------------------------------------
@@ -4464,6 +4568,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("ping", ping_command))
+    app.add_handler(CommandHandler("purgecache", purge_cache_command))
     app.add_handler(CommandHandler("allow", allow_command))
     app.add_handler(CommandHandler("allowgroup", allow_command))
     app.add_handler(CommandHandler("disallow", disallow_command))
