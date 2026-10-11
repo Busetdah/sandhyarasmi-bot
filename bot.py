@@ -348,7 +348,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo') OR (kind = 'text' AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%'))")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo') OR (kind IN ('text', 'photo') AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%'))")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     try:
@@ -1864,13 +1864,24 @@ def extract_facebook(url: str) -> dict | None:
                 "_kind": "video",
             }
 
-    # 5. Collect all image tags (OpenGraph, <img> elements, and full-resolution script matches)
+    # 5. Collect all image tags (OpenGraph, <img> elements, full-resolution script matches, and post embed plugin for albums)
     image_tags = soup.find_all("meta", property="og:image") or soup.find_all("meta", attrs={"name": "og:image"})
     if not image_tags:
         image_tags = soup.find_all("meta", property="og:image:secure_url") or soup.find_all("meta", attrs={"name": "twitter:image"})
 
-    image_urls = []
-    seen_images = set()
+    images_by_key = {}  # base_key -> (clean_url, score)
+
+    def get_image_score(u: str) -> int:
+        u_low = u.lower()
+        mx = re.search(r'mx(\d+)x(\d+)', u_low)
+        if mx:
+            return int(mx.group(1)) * int(mx.group(2))
+        sp = re.search(r'[sp](\d+)x(\d+)', u_low)
+        if sp:
+            return int(sp.group(1)) * int(sp.group(2))
+        if "stp=" not in u_low and "ctp=" not in u_low:
+            return 2000000
+        return 100000
 
     def add_image_candidate(u: str, is_primary_og: bool = False):
         if not u:
@@ -1889,9 +1900,12 @@ def extract_facebook(url: str) -> dict | None:
         # Normalize base filename to avoid duplicate URLs of different CDN query strings
         base_match = re.search(r'(/[^/?#]+\.(?:jpg|jpeg|png))', clean)
         base_key = base_match.group(1) if base_match else clean.split('?')[0]
-        if base_key not in seen_images:
-            seen_images.add(base_key)
-            image_urls.append(clean)
+        score = get_image_score(clean)
+        if base_key not in images_by_key:
+            images_by_key[base_key] = (clean, score)
+        else:
+            if score > images_by_key[base_key][1]:
+                images_by_key[base_key] = (clean, score)
 
     for tag in image_tags:
         add_image_candidate(tag.get("content"), is_primary_og=True)
@@ -1902,15 +1916,83 @@ def extract_facebook(url: str) -> dict | None:
         if src and "fbcdn.net" in src.lower() and any(k in src for k in ["/t39.", "/t1.", "/t31.", "/v/t"]):
             add_image_candidate(src)
 
-    # In case of carousel / multi-photo posts where only 1 og:image is present,
-    # scan HTML and script payload for additional full-res photo URLs
-    if len(image_urls) <= 1:
-        script_matches = re.findall(
-            r'https:(?:\\/\\/|//)[a-zA-Z0-9.-]+\.fbcdn\.net(?:\\/|/)v(?:\\/|/)t[0-9.]+-6(?:\\/|/)[^"\'\s<>]+\.(?:jpg|jpeg|png)[^"\'\s<>]*',
-            html_text
-        )
-        for sm in script_matches:
-            add_image_candidate(sm)
+    # Scan HTML and script payload for additional full-res photo URLs
+    script_matches = re.findall(
+        r'https:(?:\\/\\/|//)[a-zA-Z0-9.-]+\.fbcdn\.net(?:\\/|/)v(?:\\/|/)t[0-9.]+-6(?:\\/|/)[^"\'\s<>]+\.(?:jpg|jpeg|png)[^"\'\s<>]*',
+        html_text
+    )
+    for sm in script_matches:
+        add_image_candidate(sm)
+
+    # For carousel / album / multi-photo posts:
+    # Facebook's SSR crawler response only includes 1 og:image.
+    # To extract the full photo album, query Facebook's official post embed endpoint.
+    embed_target_urls = []
+
+    m_perma = re.search(r'permalink\.php\?story_fbid=([^"\'&]+)&(?:amp;)?id=(\d+)', html_text)
+    if m_perma:
+        embed_target_urls.append(f"https://www.facebook.com/permalink.php?story_fbid={m_perma.group(1)}&id={m_perma.group(2)}")
+
+    for cand in ([og_url] if og_url else []) + canonical_candidates + [clean_url]:
+        if not cand:
+            continue
+        cand_clean = cand.split('?')[0].rstrip('/')
+        m_num = re.search(r'facebook\.com/(?:people/[^/]+/)?(\d+)/posts/(?:[^/]+/)?(\d+)', cand_clean)
+        if m_num:
+            embed_target_urls.append(f"https://www.facebook.com/{m_num.group(1)}/posts/{m_num.group(2)}/")
+        m_named = re.search(r'facebook\.com/([^/?#]+)/posts/(?:[^/]+/)?(\d+)', cand_clean)
+        if m_named and m_named.group(1) not in ("share", "people", "watch", "reel"):
+            embed_target_urls.append(f"https://www.facebook.com/{m_named.group(1)}/posts/{m_named.group(2)}/")
+        if "permalink.php" in cand:
+            embed_target_urls.append(cand)
+
+    seen_embeds = set()
+    for et_url in embed_target_urls:
+        if et_url in seen_embeds:
+            continue
+        seen_embeds.add(et_url)
+        try:
+            embed_api = f"https://www.facebook.com/plugins/post.php?href={quote(et_url, safe='')}"
+            p_resp = HTTP_SESSION.get(
+                embed_api,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+                cookies=cookies_jar,
+                timeout=EXTRACT_TIMEOUT,
+            )
+            if p_resp.status_code == 200 and "fbcdn.net" in p_resp.text:
+                p_text = p_resp.text
+                # 1. Structured JSON-LD ImageObject contentUrl
+                for ld_m in re.finditer(r'"contentUrl"\s*:\s*"([^"]+)"', p_text):
+                    add_image_candidate(ld_m.group(1))
+                # 2. Embed post <img> tags
+                p_soup = BeautifulSoup(p_text, "html.parser")
+                for p_img in p_soup.find_all("img"):
+                    for attr in ["data-src", "src"]:
+                        v = p_img.get(attr)
+                        if v and "fbcdn.net" in v.lower():
+                            add_image_candidate(v)
+                # 3. Direct regex match
+                for sm in re.finditer(r'https:(?:\\/\\/|//)[a-zA-Z0-9.-]+\.fbcdn\.net(?:\\/|/)v(?:\\/|/)t[0-9.]+-6(?:\\/|/)[^"\'\s<>]+\.(?:jpg|jpeg|png)[^"\'\s<>]*', p_text):
+                    add_image_candidate(sm.group(0))
+                # 4. Fill in caption or uploader if missing
+                if not caption:
+                    p_caption = p_soup.find("div", class_="_5pbx") or p_soup.find("div", class_="userContent")
+                    if p_caption:
+                        caption = p_caption.get_text(separator="\n").strip()
+                if not uploader:
+                    p_author = re.search(r'"author"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', p_text)
+                    if p_author:
+                        uploader = p_author.group(1).strip()
+                if len(images_by_key) > 1:
+                    break
+        except Exception as e:
+            log.debug("Facebook post embed extraction attempt failed for %s: %s", et_url, e)
+
+    image_urls = [val[0] for val in images_by_key.values()]
 
     if len(image_urls) > 1:
         log.info("Facebook album extracted with %d images for %s", len(image_urls), clean_url)
