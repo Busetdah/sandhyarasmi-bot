@@ -3376,12 +3376,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data.startswith("dl_cancel:"):
         token = data.split(":", 1)[1]
-        PENDING_AUDIO_DOWNLOADS.pop(token, None)
+        session = PENDING_AUDIO_DOWNLOADS.pop(token, None)
+        size_str = ""
+        if session and session.get("detected_size_mb"):
+            size_str = f" (~{int(session['detected_size_mb'])} MB)"
         try:
-            await query.message.delete()
+            await query.edit_message_text(
+                f"❌ <b>Pengunduhan dibatalkan.</b>\n\nUkuran video{size_str} melebihi batas 50 MB Telegram.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+            async def _delayed_delete_cancel(msg_obj):
+                await asyncio.sleep(5)
+                try:
+                    await msg_obj.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_delayed_delete_cancel(query.message))
         except Exception:
             try:
-                await query.edit_message_text("❌ Pengunduhan dibatalkan.", reply_markup=None)
+                await query.message.delete()
             except Exception:
                 pass
 
@@ -3594,6 +3608,7 @@ async def prompt_large_video_audio_fallback(
         "orig_msg_id": message.message_id,
         "caption": caption,
         "info": info,
+        "detected_size_mb": detected_size_mb,
         "created_at": now,
     }
 
@@ -3613,17 +3628,30 @@ async def prompt_large_video_audio_fallback(
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    target_msg = None
     if status_msg:
         try:
-            await status_msg.edit_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-            return True
+            target_msg = await status_msg.edit_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
         except Exception as e:
             log.warning("Could not edit status_msg for large video prompt: %s", e)
 
-    try:
-        await message.reply_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-    except Exception as e:
-        log.warning("Could not send large video prompt: %s", e)
+    if not target_msg:
+        try:
+            target_msg = await message.reply_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        except Exception as e:
+            log.warning("Could not send large video prompt: %s", e)
+
+    # Auto-expire after 60 seconds if not clicked
+    if target_msg:
+        async def _auto_expire_prompt(tok: str, msg_obj):
+            await asyncio.sleep(60)
+            if PENDING_AUDIO_DOWNLOADS.pop(tok, None):
+                try:
+                    await msg_obj.delete()
+                except Exception:
+                    pass
+        asyncio.create_task(_auto_expire_prompt(token, target_msg))
+
     return True
 
 
