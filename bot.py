@@ -71,7 +71,7 @@ WORKER_BASE_URL = os.environ.get("WORKER_BASE_URL", "https://tg-relay.sandhyaras
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/data/cache.db")
 COOKIES_FILE_PATH = os.environ.get("COOKIES_FILE_PATH", "/data/cookies.txt")
-MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 49 * 1024 * 1024))
+MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
 EXTRACT_TIMEOUT = int(os.environ.get("EXTRACT_TIMEOUT", 30))
 COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 0.0))
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
@@ -875,6 +875,7 @@ def extract_tiktok(url: str) -> dict | None:
                             "title": title,
                             "description": title,
                             "uploader": uploader,
+                            "canonical_url": resolved_url or url,
                         }
 
                     play_url = data.get("play") or data.get("wmplay")
@@ -893,6 +894,7 @@ def extract_tiktok(url: str) -> dict | None:
                             "title": title,
                             "description": title,
                             "uploader": uploader,
+                            "canonical_url": resolved_url or url,
                             "_kind": "video",
                         }
         except Exception as e:
@@ -3510,7 +3512,7 @@ async def download_and_send_via_ytdlp(
     # Clean playlist / radio parameters from YouTube URL if any
     is_yt = "youtube.com" in url.lower() or "youtu.be" in url.lower()
     is_ig = "instagram.com" in url.lower()
-    clean_target_url = url
+    clean_target_url = (info.get("canonical_url") or url) if info else url
     if is_yt:
         m_short = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]+)", clean_target_url)
         if m_short:
@@ -3570,18 +3572,10 @@ async def download_and_send_via_ytdlp(
 
     actual_file = None
     try:
-        # Format selector: prioritize compact, fast-upload formats (720p/480p/360p) to minimize home Wi-Fi upload load
+        # Format selector: best source quality without downscaling/transcoding
         format_spec = (
-            "bestvideo[height<=720][filesize<25M][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=720][filesize_approx<25M]+bestaudio/"
-            "bestvideo[height<=480]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=480]+bestaudio/"
-            "best[height<=720][filesize<25M]/"
-            "best[height<=480]/"
-            "bestvideo[height<=720]+bestaudio/"
-            "best[height<=720]/"
-            "bestvideo[height<=360]+bestaudio/"
-            "best[height<=360]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
             "best"
         )
         cmd_video = [
@@ -3592,6 +3586,7 @@ async def download_and_send_via_ytdlp(
             "--buffer-size", "1024K",
             "-f", format_spec,
             "--merge-output-format", "mp4",
+            "--postprocessor-args", "ffmpeg:-c copy",
             "-o", out_template,
         ]
         if is_yt:
@@ -3618,6 +3613,7 @@ async def download_and_send_via_ytdlp(
                 "--no-warnings",
                 "-f", "bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
+                "--postprocessor-args", "ffmpeg:-c copy",
                 "-o", out_template,
             ]
             if is_yt:
@@ -4050,7 +4046,6 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             width=width,
                             height=height,
                             duration=duration,
-                            thumbnail=thumb_input,
                             supports_streaming=True,
                         ),
                         read_timeout=90.0,
@@ -4068,7 +4063,6 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             width=width,
                             height=height,
                             duration=duration,
-                            thumbnail=thumb_input,
                         ),
                         read_timeout=90.0,
                         write_timeout=90.0,
@@ -4090,7 +4084,6 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                         width=width,
                         height=height,
                         duration=duration,
-                        thumbnail=thumb_input,
                         read_timeout=90.0,
                         write_timeout=90.0,
                     )
@@ -4103,7 +4096,6 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                         width=width,
                         height=height,
                         duration=duration,
-                        thumbnail=thumb_input,
                         supports_streaming=True,
                         read_timeout=90.0,
                         write_timeout=90.0,
@@ -4140,16 +4132,15 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                         r = await asyncio.to_thread(HTTP_SESSION.get, direct["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=35)
                     if r.status_code == 200 and r.content:
                         thumb_file = None
-                        if kind in ("video", "animation"):
-                            p_w, p_h, p_d, p_thumb = await asyncio.to_thread(extract_video_meta_and_thumb, r.content)
-                            if p_w and p_h:
-                                width, height = p_w, p_h
-                                log.info("Probed video dimensions: %dx%d (dur=%s)", width, height, p_d)
-                            if p_d:
-                                duration = p_d
-                            if p_thumb:
-                                thumb_file = io.BytesIO(p_thumb)
-                                thumb_file.name = "thumb.jpg"
+                        # Fetch original cover thumbnail directly via HTTP to eliminate CPU decode bottleneck
+                        if direct and direct.get("thumbnail"):
+                            try:
+                                r_th = await asyncio.to_thread(HTTP_SESSION.get, direct["thumbnail"], headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                                if r_th.status_code == 200 and r_th.content:
+                                    thumb_file = io.BytesIO(r_th.content)
+                                    thumb_file.name = "thumb.jpg"
+                            except Exception:
+                                thumb_file = None
 
                         buf = io.BytesIO(r.content)
                         buf.name = f"media.{'mp4' if kind == 'video' else ('gif' if kind == 'animation' else 'jpg')}"
@@ -4161,8 +4152,10 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                                 width=width,
                                 height=height,
                                 duration=duration,
-                                thumbnail=thumb_file or thumb_input,
+                                thumbnail=thumb_file,
                                 supports_streaming=True,
+                                read_timeout=180.0,
+                                write_timeout=180.0,
                             )
                             file_id = sent.video.file_id if sent.video else (sent.document.file_id if sent.document else "")
                             uploaded = True
@@ -4174,7 +4167,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                                 width=width,
                                 height=height,
                                 duration=duration,
-                                thumbnail=thumb_file or thumb_input,
+                                thumbnail=thumb_file,
+                                read_timeout=180.0,
+                                write_timeout=180.0,
                             )
                             file_id = sent.animation.file_id if sent.animation else (sent.document.file_id if sent.document else "")
                             uploaded = True
@@ -4183,6 +4178,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                                 photo=buf,
                                 caption=caption,
                                 parse_mode=ParseMode.HTML,
+                                read_timeout=120.0,
+                                write_timeout=120.0,
                             )
                             file_id = sent.photo[-1].file_id if sent.photo else ""
                             uploaded = True
@@ -4190,8 +4187,9 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                     log.warning("Buffer upload fallback failed for %s: %s", url, e2)
 
                 if not uploaded:
-                    log.info("Trying yt-dlp direct download fallback for %s", url)
-                    success = await download_and_send_via_ytdlp(url, message, caption, status_msg, info=info)
+                    target_dl_url = (info.get("canonical_url") or url) if info else url
+                    log.info("Trying yt-dlp direct download fallback for %s", target_dl_url)
+                    success = await download_and_send_via_ytdlp(target_dl_url, message, caption, status_msg, info=info)
                     if not success:
                         err_msg = f"⚠️ Maaf, gagal memuat media. Link asli: {url}"
                         if status_msg:
