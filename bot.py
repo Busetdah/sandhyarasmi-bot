@@ -2214,6 +2214,80 @@ def build_relay_url(direct_url: str, kind: str, ext: str = "") -> str:
     return f"{WORKER_BASE_URL}/{path}?token={quote(WORKER_TOKEN)}&src={quote(direct_url, safe='')}"
 
 
+async def cloud_upload_via_worker(
+    media_url: str,
+    chat_id: int,
+    caption: str,
+    kind: str = "video",
+    duration: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    thumbnail_url: str | None = None,
+    status_msg_id: int | None = None,
+) -> dict | None:
+    """Trigger Cloudflare Worker to directly stream-upload media to Telegram (True Zero-Download up to 50MB in ~1.5s)."""
+    if not WORKER_BASE_URL:
+        return None
+    endpoint = f"{WORKER_BASE_URL}/cloud-upload"
+
+    secret = WORKER_TOKEN or "rajaibelis123"
+    tg_base = os.environ.get("TELEGRAM_API_BASE_URL", "").strip()
+    if "/bot" in tg_base:
+        secret_part = tg_base.split("/bot")[-1].strip("/")
+        if secret_part:
+            secret = secret_part
+
+    payload = {
+        "secret": secret,
+        "token": secret,
+        "media_url": media_url,
+        "chat_id": chat_id,
+        "caption": caption,
+        "parse_mode": "HTML",
+        "kind": kind,
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "thumbnail_url": thumbnail_url,
+    }
+    if status_msg_id:
+        payload["message_id"] = status_msg_id
+
+    try:
+        log.info("Triggering Cloudflare Worker cloud-upload for %s (chat=%s, kind=%s)", media_url, chat_id, kind)
+        resp = await asyncio.to_thread(
+            HTTP_SESSION.post,
+            endpoint,
+            json=payload,
+            headers={"x-gateway-secret": secret},
+            timeout=45,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("ok"):
+                result = data.get("result", {})
+                file_id = ""
+                if result.get("video"):
+                    file_id = result["video"].get("file_id")
+                elif result.get("animation"):
+                    file_id = result["animation"].get("file_id")
+                elif result.get("photo"):
+                    file_id = result["photo"][-1].get("file_id")
+                log.info("Cloudflare Worker cloud-upload succeeded (file_id=%s)", file_id)
+                return {
+                    "file_id": file_id,
+                    "message_id": result.get("message_id"),
+                    "raw": result,
+                }
+            else:
+                log.warning("Cloudflare Worker cloud-upload Telegram error: %s", data.get("description"))
+        else:
+            log.warning("Cloudflare Worker cloud-upload returned status %d: %s", resp.status_code, resp.text[:300])
+    except Exception as e:
+        log.warning("Cloudflare Worker cloud-upload failed: %s", e)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Telegram UI & Keyboards
 # ---------------------------------------------------------------------------
@@ -3985,20 +4059,18 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
         direct = pick_direct_url(info)
         filesize = direct.get("filesize") if direct else None
 
-        # Check if direct relay is suitable (progressive stream exists and <= MAX_RELAY_BYTES)
-        # If direct is None (e.g. YouTube DASH video requiring audio/video merge) or exceeds MAX_RELAY_BYTES: fallback to yt-dlp
-        if direct is None or (filesize and filesize > MAX_RELAY_BYTES):
-            log.info("Direct relay not available (direct=%s, size=%s). Trying yt-dlp downloader for %s", direct is not None, filesize, url)
-            success = await download_and_send_via_ytdlp(url, message, caption, status_msg, info=info)
-            if success:
-                return
-            if direct is None:
+        # If direct progressive stream is None (e.g. YouTube DASH video requiring audio/video merge): fallback to yt-dlp
+        if direct is None:
+            log.info("Direct progressive stream not available. Trying yt-dlp downloader for %s", url)
+            target_dl = (info.get("canonical_url") or url) if info else url
+            success = await download_and_send_via_ytdlp(target_dl, message, caption, status_msg, info=info)
+            if not success:
                 err_msg = f"⚠️ Maaf, gagal mengunduh media dari link ini. Link asli: {url}"
                 if status_msg:
                     await status_msg.edit_text(err_msg)
                 else:
                     await message.reply_text(err_msg)
-                return
+            return
 
         kind = info.get("_kind", "photo")
         ext = direct.get("ext") or info.get("ext") or ""
@@ -4021,8 +4093,10 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
         file_id = ""
         was_edited = False
 
-        # Attempt In-Place Edit First (editMessageMedia)
-        if status_msg:
+        can_try_relay = not filesize or filesize <= MAX_RELAY_BYTES
+
+        # Tier 1: Attempt In-Place Edit First (editMessageMedia via Direct URL Relay if <= MAX_RELAY_BYTES)
+        if can_try_relay and status_msg:
             try:
                 if kind == "photo":
                     sent = await status_msg.edit_media(
@@ -4073,8 +4147,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e_edit:
                 log.info("edit_media in-place fallback to direct send: %s", e_edit)
 
-        # Fallback to direct reply send if not edited in-place
-        if not was_edited:
+        # Tier 1: Fallback to direct reply send if not edited in-place (and <= MAX_RELAY_BYTES)
+        if can_try_relay and not was_edited and not file_id:
             try:
                 if kind == "animation":
                     sent = await message.reply_animation(
@@ -4121,88 +4195,115 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                             pass
                     return
 
-                log.warning("Direct URL relay failed for %s: %s (falling back to yt-dlp & buffer upload)", url, e)
-                
-                # Tier 2: Stream Buffer Upload or yt-dlp Fallback
-                uploaded = False
-                try:
-                    r = await asyncio.to_thread(HTTP_SESSION.get, relay_url, timeout=35)
-                    if (r.status_code != 200 or not r.content) and direct and direct.get("url"):
-                        log.info("Relay URL fetch failed (%d), falling back to direct URL fetch for %s", r.status_code, url)
-                        r = await asyncio.to_thread(HTTP_SESSION.get, direct["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=35)
-                    if r.status_code == 200 and r.content:
-                        thumb_file = None
-                        # Fetch original cover thumbnail directly via HTTP to eliminate CPU decode bottleneck
-                        if direct and direct.get("thumbnail"):
-                            try:
-                                r_th = await asyncio.to_thread(HTTP_SESSION.get, direct["thumbnail"], headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                                if r_th.status_code == 200 and r_th.content:
-                                    thumb_file = io.BytesIO(r_th.content)
-                                    thumb_file.name = "thumb.jpg"
-                            except Exception:
-                                thumb_file = None
+                log.warning("Direct URL relay failed for %s: %s (will try cloud-upload or buffer fallback)", url, e)
 
-                        buf = io.BytesIO(r.content)
-                        buf.name = f"media.{'mp4' if kind == 'video' else ('gif' if kind == 'animation' else 'jpg')}"
-                        if kind == "video":
-                            sent = await message.reply_video(
-                                video=buf,
-                                caption=caption,
-                                parse_mode=ParseMode.HTML,
-                                width=width,
-                                height=height,
-                                duration=duration,
-                                thumbnail=thumb_file,
-                                supports_streaming=True,
-                                read_timeout=180.0,
-                                write_timeout=180.0,
-                            )
-                            file_id = sent.video.file_id if sent.video else (sent.document.file_id if sent.document else "")
-                            uploaded = True
-                        elif kind == "animation":
-                            sent = await message.reply_animation(
-                                animation=buf,
-                                caption=caption,
-                                parse_mode=ParseMode.HTML,
-                                width=width,
-                                height=height,
-                                duration=duration,
-                                thumbnail=thumb_file,
-                                read_timeout=180.0,
-                                write_timeout=180.0,
-                            )
-                            file_id = sent.animation.file_id if sent.animation else (sent.document.file_id if sent.document else "")
-                            uploaded = True
-                        else:
-                            sent = await message.reply_photo(
-                                photo=buf,
-                                caption=caption,
-                                parse_mode=ParseMode.HTML,
-                                read_timeout=120.0,
-                                write_timeout=120.0,
-                            )
-                            file_id = sent.photo[-1].file_id if sent.photo else ""
-                            uploaded = True
-                except Exception as e2:
-                    log.warning("Buffer upload fallback failed for %s: %s", url, e2)
+        # Tier 1.5: Cloudflare Worker Cloud-Upload (True Zero-Download for files up to 50MB)
+        if not file_id and not was_edited and direct and direct.get("url") and (not filesize or filesize <= 50 * 1024 * 1024):
+            status_id = status_msg.message_id if status_msg else None
+            cloud_res = await cloud_upload_via_worker(
+                media_url=direct["url"],
+                chat_id=message.chat_id,
+                caption=caption,
+                kind=kind,
+                duration=duration,
+                width=width,
+                height=height,
+                thumbnail_url=direct.get("thumbnail"),
+                status_msg_id=status_id,
+            )
+            if cloud_res:
+                file_id = cloud_res.get("file_id", "")
+                if status_id and cloud_res.get("message_id") == status_id:
+                    was_edited = True
+                elif status_msg:
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                    status_msg = None
 
-                if not uploaded:
-                    target_dl_url = (info.get("canonical_url") or url) if info else url
-                    log.info("Trying yt-dlp direct download fallback for %s", target_dl_url)
-                    success = await download_and_send_via_ytdlp(target_dl_url, message, caption, status_msg, info=info)
-                    if not success:
-                        err_msg = f"⚠️ Maaf, gagal memuat media. Link asli: {url}"
-                        if status_msg:
-                            await status_msg.edit_text(err_msg)
-                        else:
-                            await message.reply_text(err_msg)
-                    return
+        # Tier 2: Stream Buffer Upload in RAM Fallback (if Tier 1 & Tier 1.5 failed or skipped)
+        if not file_id and not was_edited:
+            uploaded = False
+            try:
+                r = await asyncio.to_thread(HTTP_SESSION.get, relay_url, timeout=35)
+                if (r.status_code != 200 or not r.content) and direct and direct.get("url"):
+                    log.info("Relay URL fetch failed (%d), falling back to direct URL fetch for %s", r.status_code, url)
+                    r = await asyncio.to_thread(HTTP_SESSION.get, direct["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=35)
+                if r.status_code == 200 and r.content:
+                    thumb_file = None
+                    if direct and direct.get("thumbnail"):
+                        try:
+                            r_th = await asyncio.to_thread(HTTP_SESSION.get, direct["thumbnail"], headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                            if r_th.status_code == 200 and r_th.content:
+                                thumb_file = io.BytesIO(r_th.content)
+                                thumb_file.name = "thumb.jpg"
+                        except Exception:
+                            thumb_file = None
 
-            if status_msg and not was_edited:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+                    buf = io.BytesIO(r.content)
+                    buf.name = f"media.{'mp4' if kind == 'video' else ('gif' if kind == 'animation' else 'jpg')}"
+                    if kind == "video":
+                        sent = await message.reply_video(
+                            video=buf,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML,
+                            width=width,
+                            height=height,
+                            duration=duration,
+                            thumbnail=thumb_file,
+                            supports_streaming=True,
+                            read_timeout=180.0,
+                            write_timeout=180.0,
+                        )
+                        file_id = sent.video.file_id if sent.video else (sent.document.file_id if sent.document else "")
+                        uploaded = True
+                    elif kind == "animation":
+                        sent = await message.reply_animation(
+                            animation=buf,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML,
+                            width=width,
+                            height=height,
+                            duration=duration,
+                            thumbnail=thumb_file,
+                            read_timeout=180.0,
+                            write_timeout=180.0,
+                        )
+                        file_id = sent.animation.file_id if sent.animation else (sent.document.file_id if sent.document else "")
+                        uploaded = True
+                    else:
+                        sent = await message.reply_photo(
+                            photo=buf,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML,
+                            read_timeout=120.0,
+                            write_timeout=120.0,
+                        )
+                        file_id = sent.photo[-1].file_id if sent.photo else ""
+                        uploaded = True
+            except Exception as e2:
+                log.warning("Buffer upload fallback failed for %s: %s", url, e2)
+
+            # Tier 3: yt-dlp Direct Download Fallback
+            if not uploaded:
+                target_dl_url = (info.get("canonical_url") or url) if info else url
+                log.info("Trying yt-dlp direct download fallback for %s", target_dl_url)
+                success = await download_and_send_via_ytdlp(target_dl_url, message, caption, status_msg, info=info)
+                if not success:
+                    err_msg = f"⚠️ Maaf, gagal memuat media. Link asli: {url}"
+                    if status_msg:
+                        await status_msg.edit_text(err_msg)
+                    else:
+                        await message.reply_text(err_msg)
+                return
+
+        if status_msg and not was_edited:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
 
         if file_id:
             cache_set(url, kind, file_id, caption)
