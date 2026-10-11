@@ -1953,16 +1953,30 @@ def extract_facebook(url: str) -> dict | None:
         seen_embeds.add(et_url)
         try:
             embed_api = f"https://www.facebook.com/plugins/post.php?href={quote(et_url, safe='')}"
+            log.info("Trying Facebook embed plugin for %s", et_url)
             p_resp = HTTP_SESSION.get(
                 embed_api,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "User-Agent": "Twitterbot/1.0",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
                 },
                 cookies=cookies_jar,
                 timeout=EXTRACT_TIMEOUT,
             )
+            if p_resp.status_code != 200 or "fbcdn.net" not in p_resp.text:
+                log.info("Twitterbot UA on embed plugin got status %d, trying desktop UA...", p_resp.status_code)
+                p_resp = HTTP_SESSION.get(
+                    embed_api,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                    },
+                    cookies=cookies_jar,
+                    timeout=EXTRACT_TIMEOUT,
+                )
+            log.info("Facebook embed plugin response status: %d (length: %d)", p_resp.status_code, len(p_resp.text))
             if p_resp.status_code == 200 and "fbcdn.net" in p_resp.text:
                 p_text = p_resp.text
                 # 1. Structured JSON-LD ImageObject contentUrl
@@ -1987,10 +2001,11 @@ def extract_facebook(url: str) -> dict | None:
                     p_author = re.search(r'"author"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', p_text)
                     if p_author:
                         uploader = p_author.group(1).strip()
+                log.info("Total unique post photos found so far: %d", len(images_by_key))
                 if len(images_by_key) > 1:
                     break
         except Exception as e:
-            log.debug("Facebook post embed extraction attempt failed for %s: %s", et_url, e)
+            log.warning("Facebook post embed extraction attempt failed for %s: %s", et_url, e)
 
     image_urls = [val[0] for val in images_by_key.values()]
 
