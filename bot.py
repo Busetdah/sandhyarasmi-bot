@@ -2520,13 +2520,27 @@ async def purge_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     if not message or not is_tester(user):
         return
-    deleted = await asyncio.to_thread(purge_old_cache, CACHE_RETENTION_DAYS)
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply_text("🔒 Perintah `/purgecache` hanya dapat digunakan di Private Message (DM) bot.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    days_to_purge = CACHE_RETENTION_DAYS
+    if context.args:
+        arg = context.args[0].lower().strip()
+        if arg == "all":
+            days_to_purge = 0
+        elif arg.isdigit():
+            days_to_purge = int(arg)
+
+    deleted = await asyncio.to_thread(purge_old_cache, days_to_purge)
     cleaned = await asyncio.to_thread(clean_orphan_temp_files)
     row = DB.execute("SELECT COUNT(*) FROM cache").fetchone()
     remaining = row[0] if row else 0
+
+    dur_text = "semua cache" if days_to_purge == 0 else f"> {days_to_purge} hari"
     await message.reply_text(
         f"🧹 **Pembersihan Cache Selesai!**\n\n"
-        f"🗑️ Dihapus: {deleted} item cache (> {CACHE_RETENTION_DAYS} hari)\n"
+        f"🗑️ Dihapus: {deleted:,} item cache ({dur_text})\n"
         f"📁 File temp dibersihkan: {cleaned}\n"
         f"📦 Sisa cache aktif: {remaining:,} media",
         parse_mode=ParseMode.MARKDOWN,
