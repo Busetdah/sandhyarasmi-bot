@@ -348,7 +348,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo')")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind = 'photo') OR (kind = 'text' AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%'))")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     try:
@@ -1300,8 +1300,11 @@ def is_avatar_url(u: str) -> bool:
         "profile_images", "abs.twimg.com", "default_profile", "twimg.com/sticky"
     ]):
         return True
-    if re.search(r"[sp]\d+x\d+", u_lower):  # e.g. s50x50, s100x100, s150x150, s320x320, s640x640, p50x50, p100x100
-        return True
+    m = re.search(r"[sp](\d+)x(\d+)", u_lower)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        if w <= 160 and h <= 160:
+            return True
     return False
 
 
@@ -1869,7 +1872,7 @@ def extract_facebook(url: str) -> dict | None:
     image_urls = []
     seen_images = set()
 
-    def add_image_candidate(u: str):
+    def add_image_candidate(u: str, is_primary_og: bool = False):
         if not u:
             return
         clean = html.unescape(u).replace(r'\/', '/').replace('&amp;', '&').replace(r'\u0026', '&').strip()
@@ -1877,8 +1880,12 @@ def extract_facebook(url: str) -> dict | None:
             return
         if any(k in clean.lower() for k in ["/rsrc.php", "static.", "favicon", ".webp", "emoji"]):
             return
-        if is_avatar_url(clean):
-            return
+        if is_primary_og:
+            if any(k in clean.lower() for k in ["profile_pic", "avatar", "profile_picture", "/identity/", "t39.92108-6"]):
+                return
+        else:
+            if is_avatar_url(clean):
+                return
         # Normalize base filename to avoid duplicate URLs of different CDN query strings
         base_match = re.search(r'(/[^/?#]+\.(?:jpg|jpeg|png))', clean)
         base_key = base_match.group(1) if base_match else clean.split('?')[0]
@@ -1887,7 +1894,7 @@ def extract_facebook(url: str) -> dict | None:
             image_urls.append(clean)
 
     for tag in image_tags:
-        add_image_candidate(tag.get("content"))
+        add_image_candidate(tag.get("content"), is_primary_og=True)
 
     # Also check <img> tags for post photos
     for img in soup.find_all("img"):
