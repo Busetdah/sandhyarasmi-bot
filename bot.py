@@ -2518,7 +2518,7 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def purge_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
-    if not message or not is_tester(user):
+    if not message or not is_owner(user):
         return
     if message.chat.type != ChatType.PRIVATE:
         await message.reply_text("🔒 Perintah `/purgecache` hanya dapat digunakan di Private Message (DM) bot.", parse_mode=ParseMode.MARKDOWN)
