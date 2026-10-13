@@ -1343,12 +1343,14 @@ def extract_instagram(url: str) -> dict | None:
     log.info("Extracting Instagram (Hybrid Pipeline) for clean URL: %s", clean_url)
 
     use_auth = has_active_cookies()
-    # 1. If cookies are active, prioritize authenticated yt-dlp for full original 1080p quality
-    if use_auth:
-        log.info("Attempting yt-dlp extraction for Instagram (authenticated) for %s", clean_url)
-        ytdlp_res = ytdlp_extract(clean_url, use_cookies=True)
+    is_reel = "/reel/" in clean_url.lower()
+
+    # 1. Prioritize yt-dlp for Reels or when authenticated cookies are active (Full 1080p pristine quality)
+    if use_auth or is_reel:
+        log.info("Attempting yt-dlp extraction for Instagram (auth=%s, is_reel=%s) for %s", use_auth, is_reel, clean_url)
+        ytdlp_res = ytdlp_extract(clean_url, use_cookies=use_auth)
         if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
-            log.info("Instagram extracted via authenticated yt-dlp (full pristine quality)")
+            log.info("Instagram extracted via yt-dlp (full 1080p pristine quality)")
             return ytdlp_res
 
     # 2. Try Instagram Embed JSON (Fast, Public, No Cookies, Full Carousel support)
@@ -1357,8 +1359,8 @@ def extract_instagram(url: str) -> dict | None:
         log.info("Instagram extracted via Public Embed (Zero Cookies)")
         return embed_info
 
-    # 3. Fallback: Try public yt-dlp if not run authenticated earlier
-    if not use_auth:
+    # 3. Fallback: Try public yt-dlp if not run earlier
+    if not use_auth and not is_reel:
         log.info("Attempting public yt-dlp extraction for Instagram: %s", clean_url)
         ytdlp_res = ytdlp_extract(clean_url, use_cookies=False)
         if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
@@ -1366,7 +1368,7 @@ def extract_instagram(url: str) -> dict | None:
             return ytdlp_res
 
     # 4. Fallback: Try official oEmbed API (Public metadata & photo fallback for posts only, NEVER for reels)
-    if "/reel/" not in clean_url.lower():
+    if not is_reel:
         try:
             api_url = f"https://www.instagram.com/api/v1/oembed/?url={quote(clean_url)}"
             resp = HTTP_SESSION.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=EXTRACT_TIMEOUT)
