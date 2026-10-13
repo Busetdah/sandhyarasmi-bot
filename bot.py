@@ -991,14 +991,24 @@ def extract_tiktok(url: str) -> dict | None:
 
         if best_url:
             log.info("TikTok video extracted via TikWM (%s, size: %s bytes)", ep, best_size)
+            w = data.get("width")
+            h = data.get("height")
+            if best_url == hd_play:
+                if w and h:
+                    if w <= h:
+                        w, h = 1080, 1920
+                    else:
+                        w, h = 1920, 1080
+                else:
+                    w, h = 1080, 1920
             return {
                 "formats": formats,
                 "url": best_url,
                 "thumbnail": data.get("cover"),
                 "ext": "mp4",
                 "filesize": best_size,
-                "width": data.get("width"),
-                "height": data.get("height"),
+                "width": w,
+                "height": h,
                 "duration": duration,
                 "title": title,
                 "description": title,
@@ -1786,6 +1796,9 @@ def og_scrape_fallback(url: str) -> dict | None:
             "_kind": "video",
         }
     if image_url:
+        # Convert Pinterest preview image URLs (736x, 564x, 474x, etc.) to full-res originals
+        if "pinimg.com" in image_url:
+            image_url = re.sub(r"/(?:[0-9]+x|originals)/", "/originals/", image_url)
         return {
             "formats": [],
             "url": image_url,
@@ -4488,8 +4501,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
             kind = "animation"
 
         relay_url = build_relay_url(direct["url"], kind, ext)
-        width = direct.get("width")
-        height = direct.get("height")
+        width = direct.get("width") or None
+        height = direct.get("height") or None
         duration = int(direct["duration"]) if direct.get("duration") else None
 
         thumb_input = None
@@ -4652,6 +4665,15 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                     buf = io.BytesIO(r.content)
                     buf.name = f"media.{'mp4' if kind == 'video' else ('gif' if kind == 'animation' else 'jpg')}"
                     if kind == "video":
+                        if (not width or not height) and r.content:
+                            p_w, p_h, p_dur, p_thumb = await asyncio.to_thread(extract_video_meta_and_thumb, r.content)
+                            if p_w and p_h:
+                                width, height = p_w, p_h
+                            if p_dur and not duration:
+                                duration = p_dur
+                            if p_thumb and not thumb_file:
+                                thumb_file = io.BytesIO(p_thumb)
+                                thumb_file.name = "thumb.jpg"
                         sent = await message.reply_video(
                             video=buf,
                             caption=caption,
