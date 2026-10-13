@@ -921,118 +921,127 @@ def extract_tiktok(url: str) -> dict | None:
 
     endpoints = ["https://tikwm.com/api/", "https://www.tikwm.com/api/"]
 
+    def _parse_tikwm_data(data: dict, ep: str) -> dict | None:
+        title = data.get("title") or ""
+        author = data.get("author", {}).get("unique_id") or data.get("author", {}).get("nickname") or ""
+        uploader = f"@{author}" if author else ""
+        duration = data.get("duration")
+
+        images = data.get("images")
+        if images and isinstance(images, list) and len(images) > 0:
+            log.info("TikTok photo slide detected with %d images", len(images))
+            return {
+                "_kind": "album",
+                "items": [{"url": img, "kind": "photo"} for img in images],
+                "title": title,
+                "description": title,
+                "uploader": uploader,
+                "canonical_url": resolved_url or url,
+            }
+
+        hd_play = data.get("hdplay")
+        hd_size = data.get("hd_size")
+        sd_play = data.get("play")
+        sd_size = data.get("size")
+        wm_play = data.get("wmplay")
+        wm_size = data.get("wm_size")
+
+        formats = []
+        if sd_play:
+            formats.append({
+                "url": sd_play,
+                "format_id": "sd",
+                "filesize": sd_size,
+                "ext": "mp4",
+                "width": data.get("width"),
+                "height": data.get("height"),
+                "has_both": True,
+                "vcodec": "h264",
+                "acodec": "aac",
+            })
+        if hd_play:
+            formats.append({
+                "url": hd_play,
+                "format_id": "hd",
+                "filesize": hd_size,
+                "ext": "mp4",
+                "width": 1080 if (data.get("width") and data["width"] <= (data.get("height") or 0)) else 1920,
+                "height": 1920 if (data.get("width") and data["width"] <= (data.get("height") or 0)) else 1080,
+                "has_both": True,
+                "vcodec": "h264",
+                "acodec": "aac",
+            })
+
+        best_url = None
+        best_size = None
+        if hd_play and hd_size and hd_size <= MAX_RELAY_BYTES:
+            best_url = hd_play
+            best_size = hd_size
+            log.info("TikTok HD video selected via TikWM (%s, size: %s bytes)", ep, hd_size)
+        elif hd_play and not hd_size:
+            best_url = hd_play
+            best_size = None
+            log.info("TikTok HD video selected without explicit size via TikWM (%s)", ep)
+        elif sd_play:
+            best_url = sd_play
+            best_size = sd_size
+        else:
+            best_url = wm_play
+            best_size = wm_size
+
+        if best_url:
+            log.info("TikTok video extracted via TikWM (%s, size: %s bytes)", ep, best_size)
+            return {
+                "formats": formats,
+                "url": best_url,
+                "thumbnail": data.get("cover"),
+                "ext": "mp4",
+                "filesize": best_size,
+                "width": data.get("width"),
+                "height": data.get("height"),
+                "duration": duration,
+                "title": title,
+                "description": title,
+                "uploader": uploader,
+                "canonical_url": resolved_url or url,
+                "_kind": "video",
+            }
+        return None
+
     def _query_tikwm(ep: str, cand_url: str) -> dict | None:
+        # 1. Try POST with hd=1 first
         try:
             log.info("Querying TikTok via TikWM (%s) for %s", ep, cand_url)
-            resp = HTTP_SESSION.post(ep, data={"url": cand_url}, timeout=12)
+            resp = HTTP_SESSION.post(ep, data={"url": cand_url, "hd": "1"}, timeout=12)
             if resp.status_code == 200:
                 res_json = resp.json()
                 if res_json.get("code") == 0:
-                    data = res_json.get("data", {})
-                    title = data.get("title") or ""
-                    author = data.get("author", {}).get("unique_id") or data.get("author", {}).get("nickname") or ""
-                    uploader = f"@{author}" if author else ""
-                    duration = data.get("duration")
-
-                    images = data.get("images")
-                    if images and isinstance(images, list) and len(images) > 0:
-                        log.info("TikTok photo slide detected with %d images", len(images))
-                        return {
-                            "_kind": "album",
-                            "items": [{"url": img, "kind": "photo"} for img in images],
-                            "title": title,
-                            "description": title,
-                            "uploader": uploader,
-                            "canonical_url": resolved_url or url,
-                        }
-
-                    hd_play = data.get("hdplay")
-                    hd_size = data.get("hd_size")
-                    sd_play = data.get("play")
-                    sd_size = data.get("size")
-                    wm_play = data.get("wmplay")
-                    wm_size = data.get("wm_size")
-
-                    formats = []
-                    if sd_play:
-                        formats.append({
-                            "url": sd_play,
-                            "format_id": "sd",
-                            "filesize": sd_size,
-                            "ext": "mp4",
-                            "width": data.get("width"),
-                            "height": data.get("height"),
-                            "has_both": True,
-                            "vcodec": "h264",
-                            "acodec": "aac",
-                        })
-                    if hd_play:
-                        formats.append({
-                            "url": hd_play,
-                            "format_id": "hd",
-                            "filesize": hd_size,
-                            "ext": "mp4",
-                            "width": 1080 if (data.get("width") and data["width"] <= (data.get("height") or 0)) else 1920,
-                            "height": 1920 if (data.get("width") and data["width"] <= (data.get("height") or 0)) else 1080,
-                            "has_both": True,
-                            "vcodec": "h264",
-                            "acodec": "aac",
-                        })
-
-                    best_url = None
-                    best_size = None
-                    if hd_play and hd_size and hd_size <= MAX_RELAY_BYTES:
-                        best_url = hd_play
-                        best_size = hd_size
-                        log.info("TikTok HD video selected via TikWM (%s, size: %s bytes)", ep, hd_size)
-                    elif hd_play and not hd_size:
-                        best_url = hd_play
-                        best_size = None
-                        log.info("TikTok HD video selected without explicit size via TikWM (%s)", ep)
-                    elif sd_play:
-                        best_url = sd_play
-                        best_size = sd_size
-                    else:
-                        best_url = wm_play
-                        best_size = wm_size
-
-                    if best_url:
-                        log.info("TikTok video extracted via TikWM (%s, size: %s bytes)", ep, best_size)
-                        return {
-                            "formats": formats,
-                            "url": best_url,
-                            "thumbnail": data.get("cover"),
-                            "ext": "mp4",
-                            "filesize": best_size,
-                            "width": data.get("width"),
-                            "height": data.get("height"),
-                            "duration": duration,
-                            "title": title,
-                            "description": title,
-                            "uploader": uploader,
-                            "canonical_url": resolved_url or url,
-                            "_kind": "video",
-                        }
+                    return _parse_tikwm_data(res_json.get("data", {}), ep)
+                else:
+                    log.warning("TikWM (%s) returned code %s (msg: %s) for %s", ep, res_json.get("code"), res_json.get("msg"), cand_url)
+            elif resp.status_code == 429:
+                log.warning("TikWM (%s) HTTP 429 Too Many Requests for %s", ep, cand_url)
         except Exception as e:
-            log.warning("TikWM (%s) extraction failed for %s: %s", ep, cand_url, e)
+            log.debug("TikWM POST (%s) error for %s: %s", ep, cand_url, e)
+
+        # 2. Try GET fallback if POST returned error
+        try:
+            resp = HTTP_SESSION.get(f"{ep}?url={quote(cand_url)}&hd=1", timeout=12)
+            if resp.status_code == 200:
+                res_json = resp.json()
+                if res_json.get("code") == 0:
+                    return _parse_tikwm_data(res_json.get("data", {}), ep)
+        except Exception as e_get:
+            log.debug("TikWM GET (%s) fallback error for %s: %s", ep, cand_url, e_get)
+
         return None
 
-    # Race endpoints concurrently across candidate URLs
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_to_req = {
-            executor.submit(_query_tikwm, ep, cand_u): (ep, cand_u)
-            for cand_u in urls_to_try
-            for ep in endpoints
-        }
-        for future in as_completed(future_to_req):
-            try:
-                res = future.result()
-                if res:
-                    for f in future_to_req:
-                        f.cancel()
-                    return res
-            except Exception as e:
-                log.debug("TikWM race future exception: %s", e)
+    # Query candidate URLs sequentially (best URL first) to avoid triggering TikWM IP rate limits with concurrent floods
+    for cand_u in urls_to_try:
+        for ep in endpoints:
+            res = _query_tikwm(ep, cand_u)
+            if res:
+                return res
 
     # Fallback: yt-dlp
     target_dl_url = resolved_url or url
@@ -3647,7 +3656,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Allow media links in PM / DM
-        all_urls = URL_REGEX.findall(text)
+        all_urls = [u.rstrip(".,;:!?)>]\"'") for u in URL_REGEX.findall(text)]
         urls = [u for u in all_urls if looks_supported(u)]
         if urls:
             log.info("Incoming PM media link from %s: %s", user_info, urls)
@@ -3669,7 +3678,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_group_message(message.chat.id, message.chat.title or "Group", user.id if user else 0, user_display, text)
         log.info("💬 [CHAT] %s in %s: %s", user_display, message.chat.title or "Group", text[:100])
 
-    all_urls = URL_REGEX.findall(text)
+    all_urls = [u.rstrip(".,;:!?)>]\"'") for u in URL_REGEX.findall(text)]
     if not all_urls:
         # Chatbot handler: trigger if bot is tagged/mentioned or replied to in group
         bot_info = context.bot
@@ -4301,6 +4310,12 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
                     await message.reply_text(group_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             elif "facebook.com" in url.lower() or "fb.watch" in url.lower():
                 err_text = f"⚠️ Maaf, tidak dapat mengekstrak media dari link Facebook ini (konten mungkin bersifat privat, telah dihapus, atau memerlukan login Facebook). Link asli: {url}"
+                if status_msg:
+                    await status_msg.edit_text(err_text)
+                else:
+                    await message.reply_text(err_text)
+            elif any(k in url.lower() for k in ["tiktok.com", "douyin.com"]):
+                err_text = f"⚠️ Maaf, tidak dapat mengambil media dari link TikTok ini (video/foto mungkin bersifat privat, telah dihapus oleh pengunggah, atau server sedang membatasi akses). Link: {url}"
                 if status_msg:
                     await status_msg.edit_text(err_text)
                 else:
