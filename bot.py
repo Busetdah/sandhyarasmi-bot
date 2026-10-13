@@ -1365,33 +1365,34 @@ def extract_instagram(url: str) -> dict | None:
             log.info("Instagram extracted via public yt-dlp")
             return ytdlp_res
 
-    # 3. Fallback: Try official oEmbed API (Public metadata & photo fallback)
-    try:
-        api_url = f"https://www.instagram.com/api/v1/oembed/?url={quote(clean_url)}"
-        resp = HTTP_SESSION.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=EXTRACT_TIMEOUT)
-        if resp.status_code == 200:
-            data = resp.json()
-            thumb = data.get("thumbnail_url")
-            caption = data.get("title") or ""
-            author = data.get("author_name") or ""
-            uploader = f"@{author}" if author else ""
-            if thumb:
-                log.info("Instagram extracted via Public oEmbed fallback")
-                return {
-                    "formats": [],
-                    "url": thumb,
-                    "thumbnail": thumb,
-                    "ext": "jpg",
-                    "filesize": None,
-                    "width": data.get("thumbnail_width"),
-                    "height": data.get("thumbnail_height"),
-                    "title": caption,
-                    "description": caption,
-                    "uploader": uploader,
-                    "_kind": "photo",
-                }
-    except Exception as e:
-        log.info("extract_instagram oembed failed for %s: %s", clean_url, e)
+    # 4. Fallback: Try official oEmbed API (Public metadata & photo fallback for posts only, NEVER for reels)
+    if "/reel/" not in clean_url.lower():
+        try:
+            api_url = f"https://www.instagram.com/api/v1/oembed/?url={quote(clean_url)}"
+            resp = HTTP_SESSION.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=EXTRACT_TIMEOUT)
+            if resp.status_code == 200:
+                data = resp.json()
+                thumb = data.get("thumbnail_url")
+                caption = data.get("title") or ""
+                author = data.get("author_name") or ""
+                uploader = f"@{author}" if author else ""
+                if thumb:
+                    log.info("Instagram extracted via Public oEmbed fallback")
+                    return {
+                        "formats": [],
+                        "url": thumb,
+                        "thumbnail": thumb,
+                        "ext": "jpg",
+                        "filesize": None,
+                        "width": data.get("thumbnail_width"),
+                        "height": data.get("thumbnail_height"),
+                        "title": caption,
+                        "description": caption,
+                        "uploader": uploader,
+                        "_kind": "photo",
+                    }
+        except Exception as e:
+            log.info("extract_instagram oembed failed for %s: %s", clean_url, e)
 
     return None
 
