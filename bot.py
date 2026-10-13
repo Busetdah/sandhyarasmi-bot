@@ -348,7 +348,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind IN ('photo', 'text')) OR (kind = 'text' AND (url LIKE '%/vt.%' OR url LIKE '%/vm.%' OR url LIKE '%tiktok.com%')) OR (kind IN ('text', 'photo') AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%'))")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind IN ('photo', 'text')) OR (kind = 'text' AND (url LIKE '%/vt.%' OR url LIKE '%/vm.%' OR url LIKE '%tiktok.com%')) OR (kind IN ('text', 'photo') AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%')) OR (kind = 'video' AND (url LIKE '%youtu%'))")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     try:
@@ -946,16 +946,64 @@ def extract_tiktok(url: str) -> dict | None:
                             "canonical_url": resolved_url or url,
                         }
 
-                    play_url = data.get("play") or data.get("wmplay")
-                    size = data.get("size")
-                    if play_url:
-                        log.info("TikTok video extracted via TikWM (%s, size: %s bytes)", ep, size)
+                    hd_play = data.get("hdplay")
+                    hd_size = data.get("hd_size")
+                    sd_play = data.get("play")
+                    sd_size = data.get("size")
+                    wm_play = data.get("wmplay")
+                    wm_size = data.get("wm_size")
+
+                    formats = []
+                    if sd_play:
+                        formats.append({
+                            "url": sd_play,
+                            "format_id": "sd",
+                            "filesize": sd_size,
+                            "ext": "mp4",
+                            "width": data.get("width"),
+                            "height": data.get("height"),
+                            "has_both": True,
+                            "vcodec": "h264",
+                            "acodec": "aac",
+                        })
+                    if hd_play:
+                        formats.append({
+                            "url": hd_play,
+                            "format_id": "hd",
+                            "filesize": hd_size,
+                            "ext": "mp4",
+                            "width": 1080 if (data.get("width") and data["width"] <= (data.get("height") or 0)) else 1920,
+                            "height": 1920 if (data.get("width") and data["width"] <= (data.get("height") or 0)) else 1080,
+                            "has_both": True,
+                            "vcodec": "h264",
+                            "acodec": "aac",
+                        })
+
+                    best_url = None
+                    best_size = None
+                    if hd_play and hd_size and hd_size <= MAX_RELAY_BYTES:
+                        best_url = hd_play
+                        best_size = hd_size
+                        log.info("TikTok HD video selected via TikWM (%s, size: %s bytes)", ep, hd_size)
+                    elif hd_play and not hd_size:
+                        best_url = hd_play
+                        best_size = None
+                        log.info("TikTok HD video selected without explicit size via TikWM (%s)", ep)
+                    elif sd_play:
+                        best_url = sd_play
+                        best_size = sd_size
+                    else:
+                        best_url = wm_play
+                        best_size = wm_size
+
+                    if best_url:
+                        log.info("TikTok video extracted via TikWM (%s, size: %s bytes)", ep, best_size)
                         return {
-                            "formats": [],
-                            "url": play_url,
+                            "formats": formats,
+                            "url": best_url,
                             "thumbnail": data.get("cover"),
                             "ext": "mp4",
-                            "filesize": size,
+                            "filesize": best_size,
                             "width": data.get("width"),
                             "height": data.get("height"),
                             "duration": duration,
@@ -1018,8 +1066,13 @@ def extract_reddit(url: str) -> dict | None:
             desc = meta("og:description") or meta("twitter:description") or ""
             uploader = meta("og:site_name") or ""
 
-            if image_url and any(k in image_url for k in ["redditstatic.com", "share.redd.it/preview"]):
-                image_url = None
+            if image_url:
+                if any(k in image_url for k in ["redditstatic.com", "share.redd.it/preview"]):
+                    image_url = None
+                elif "preview.redd.it" in image_url:
+                    m_id = re.search(r'preview\.redd\.it/([a-zA-Z0-9_-]+\.(?:png|jpg|jpeg|webp|gif))', image_url)
+                    if m_id:
+                        image_url = f"https://i.redd.it/{m_id.group(1)}"
 
             embedded_imgs = []
             for img_match in re.findall(r'https://(?:preview\.redd\.it|i\.redd\.it)/[^\s"\'<>]+', desc):
@@ -1153,6 +1206,23 @@ def ytdlp_extract(url: str, use_cookies: bool = True) -> dict | None:
         return None
 
 
+def get_best_ig_media_url(node_or_media: dict, is_vid: bool) -> str:
+    if is_vid:
+        versions = node_or_media.get("video_versions")
+        if versions and isinstance(versions, list):
+            best = max(versions, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))
+            if best.get("url"):
+                return best["url"]
+        return node_or_media.get("video_url") or ""
+    else:
+        resources = node_or_media.get("display_resources")
+        if resources and isinstance(resources, list):
+            best = max(resources, key=lambda r: (r.get("config_width") or 0) * (r.get("config_height") or 0))
+            if best.get("src"):
+                return best["src"]
+        return node_or_media.get("display_url") or ""
+
+
 def extract_ig_embed(clean_url: str) -> dict | None:
     """Extract complete Instagram carousel/post data from Instagram embed HTML."""
     try:
@@ -1194,12 +1264,12 @@ def extract_ig_embed(clean_url: str) -> dict | None:
                         for child in children:
                             node = child.get("node", {})
                             is_vid = node.get("is_video", False)
-                            u = node.get("video_url") if is_vid else node.get("display_url")
+                            u = get_best_ig_media_url(node, is_vid)
                             if u:
                                 items.append({"url": u, "kind": "video" if is_vid else "photo"})
                         
                         if items:
-                            log.info("Instagram embed double-decode parsed %d carousel items", len(items))
+                            log.info("Instagram embed double-decode parsed %d carousel items (max quality)", len(items))
                             return {
                                 "_kind": "album",
                                 "items": items,
@@ -1209,7 +1279,7 @@ def extract_ig_embed(clean_url: str) -> dict | None:
                             }
                     else:
                         is_vid = media.get("is_video", False)
-                        u = media.get("video_url") if is_vid else media.get("display_url")
+                        u = get_best_ig_media_url(media, is_vid)
                         if u:
                             return {
                                 "_kind": "video" if is_vid else "photo",
@@ -1246,26 +1316,35 @@ def extract_ig_embed(clean_url: str) -> dict | None:
 
 def extract_instagram(url: str) -> dict | None:
     """Extract Instagram post using Optimized Hybrid Pipeline:
-    1. Try Public Embed JSON (Fast ~0.5s, No cookies, full carousel and video/photo support)
-    2. Try yt-dlp (Authenticated if cookies exist, else public)
-    3. Fallback: Official oEmbed API (Fast public metadata fallback)
+    1. Try Authenticated yt-dlp first if cookies active (Pristine 1080p source quality)
+    2. Try Public Embed JSON (Fast ~0.5s, No cookies, full carousel and max resolution support)
+    3. Fallback: Public yt-dlp & Official oEmbed API
     """
     clean_url = re.sub(r"\?.*$", "", url).rstrip("/") + "/"
     log.info("Extracting Instagram (Hybrid Pipeline) for clean URL: %s", clean_url)
 
-    # 1. Try Instagram Embed JSON (Fast, Public, No Cookies, Full Carousel support)
+    use_auth = has_active_cookies()
+    # 1. If cookies are active, prioritize authenticated yt-dlp for full original 1080p quality
+    if use_auth:
+        log.info("Attempting yt-dlp extraction for Instagram (authenticated) for %s", clean_url)
+        ytdlp_res = ytdlp_extract(clean_url, use_cookies=True)
+        if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
+            log.info("Instagram extracted via authenticated yt-dlp (full pristine quality)")
+            return ytdlp_res
+
+    # 2. Try Instagram Embed JSON (Fast, Public, No Cookies, Full Carousel support)
     embed_info = extract_ig_embed(clean_url)
     if embed_info:
         log.info("Instagram extracted via Public Embed (Zero Cookies)")
         return embed_info
 
-    # 2. Try yt-dlp (Directly use authenticated cookies if available to save 4-5s of failing public calls)
-    use_auth = has_active_cookies()
-    log.info("Attempting yt-dlp extraction for Instagram (authenticated=%s) for %s", use_auth, clean_url)
-    ytdlp_res = ytdlp_extract(clean_url, use_cookies=use_auth)
-    if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
-        log.info("Instagram extracted via yt-dlp (authenticated=%s)", use_auth)
-        return ytdlp_res
+    # 3. Fallback: Try public yt-dlp if not run authenticated earlier
+    if not use_auth:
+        log.info("Attempting public yt-dlp extraction for Instagram: %s", clean_url)
+        ytdlp_res = ytdlp_extract(clean_url, use_cookies=False)
+        if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
+            log.info("Instagram extracted via public yt-dlp")
+            return ytdlp_res
 
     # 3. Fallback: Try official oEmbed API (Public metadata & photo fallback)
     try:
@@ -1760,7 +1839,7 @@ def is_fb_generic_or_error(text: str) -> bool:
 def extract_facebook(url: str) -> dict | None:
     """Extract Facebook media (video, reels, photo, album, or text) via yt-dlp & OpenGraph scraper."""
     clean_url = url.strip()
-    is_video_hint = any(k in clean_url.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/"])
+    is_video_hint = any(k in clean_url.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/", "/share/v/", "/share/r/", "video.php"])
 
     # 1. If it's explicitly a video/reel URL, try yt-dlp first
     if is_video_hint:
@@ -1865,7 +1944,21 @@ def extract_facebook(url: str) -> dict | None:
             thumb_url = meta("og:image:secure_url") or meta("og:image") or meta("twitter:image")
             if thumb_url:
                 thumb_url = html.unescape(thumb_url).replace("&amp;", "&")
-            log.info("Facebook video extracted via OpenGraph meta for %s", clean_url)
+
+            # Try extracting HD stream via yt-dlp first (Facebook's og:video is usually low-res SD 360p)
+            for cand in canonical_candidates + [clean_url]:
+                if cand:
+                    try:
+                        info_hd = ytdlp_extract(cand)
+                        if info_hd and (info_hd.get("formats") or info_hd.get("url")):
+                            log.info("Facebook HD video extracted via yt-dlp for %s", cand)
+                            if info_hd.get("_kind") != "album":
+                                info_hd["_kind"] = "video"
+                            return info_hd
+                    except Exception as e_ytdl:
+                        log.debug("Facebook yt-dlp attempt on %s failed: %s", cand, e_ytdl)
+
+            log.info("Facebook video extracted via OpenGraph meta (fallback SD) for %s", clean_url)
             return {
                 "formats": [],
                 "url": clean_video_url,
@@ -2070,6 +2163,23 @@ def extract_facebook(url: str) -> dict | None:
     return None
 
 
+def get_best_twitter_image_url(u: str) -> str:
+    """Ensure Twitter image URL fetches the 100% original uncompressed resolution (?name=orig)."""
+    if not u or "twimg.com" not in u:
+        return u
+    if "name=orig" in u or u.endswith(":orig"):
+        return u
+    if "format=" in u:
+        if "name=" in u:
+            return re.sub(r"name=[^&]+", "name=orig", u)
+        return f"{u}&name=orig"
+    if "?" in u:
+        if "name=" in u:
+            return re.sub(r"name=[^&]+", "name=orig", u)
+        return f"{u}&name=orig"
+    return f"{u}?name=orig"
+
+
 def extract_twitter(url: str) -> dict | None:
     """Extract Twitter / X posts (videos, animations, photos, multi-photo albums, and text-only posts)
     using FxTwitter / VxTwitter public APIs with yt-dlp fallback.
@@ -2131,9 +2241,11 @@ def extract_twitter(url: str) -> dict | None:
                         ikind = "video" if itype in ("video", "gif") else "photo"
                         iurl = it.get("url")
                         if iurl:
+                            if ikind == "photo":
+                                iurl = get_best_twitter_image_url(iurl)
                             items.append({"url": iurl, "kind": ikind})
                     if items:
-                        log.info("Twitter album extracted with %d items for %s", len(items), clean_url)
+                        log.info("Twitter album extracted with %d items (max quality) for %s", len(items), clean_url)
                         return {
                             "_kind": "album",
                             "items": items,
@@ -2149,7 +2261,14 @@ def extract_twitter(url: str) -> dict | None:
                     if itype in ("video", "gif"):
                         thumb = item.get("thumbnail_url")
                         duration = item.get("duration")
-                        log.info("Twitter %s extracted for %s", itype, clean_url)
+                        # Pick highest bitrate video variant if available
+                        variants = item.get("variants") or []
+                        mp4_variants = [v for v in variants if v.get("url") and "mp4" in v.get("content_type", "video/mp4")]
+                        if mp4_variants:
+                            best_v = max(mp4_variants, key=lambda v: v.get("bitrate") or 0)
+                            if best_v.get("url"):
+                                iurl = best_v["url"]
+                        log.info("Twitter %s extracted at best bitrate for %s", itype, clean_url)
                         return {
                             "formats": [],
                             "url": iurl,
@@ -2163,7 +2282,8 @@ def extract_twitter(url: str) -> dict | None:
                             "_kind": "animation" if itype == "gif" else "video",
                         }
                     else:
-                        log.info("Twitter single photo extracted for %s", clean_url)
+                        iurl = get_best_twitter_image_url(iurl)
+                        log.info("Twitter single photo extracted at orig resolution for %s", clean_url)
                         return {
                             "formats": [],
                             "url": iurl,
@@ -2208,7 +2328,8 @@ def extract_twitter(url: str) -> dict | None:
                 for m in vx_media:
                     k = "video" if m.get("type") in ("video", "gif") else "photo"
                     if m.get("url"):
-                        items.append({"url": m["url"], "kind": k})
+                        u_cand = get_best_twitter_image_url(m["url"]) if k == "photo" else m["url"]
+                        items.append({"url": u_cand, "kind": k})
                 if items:
                     return {
                         "_kind": "album",
@@ -2220,9 +2341,10 @@ def extract_twitter(url: str) -> dict | None:
             elif len(vx_media) == 1:
                 m = vx_media[0]
                 k = "video" if m.get("type") in ("video", "gif") else "photo"
+                u_cand = get_best_twitter_image_url(m["url"]) if k == "photo" else m["url"]
                 return {
                     "formats": [],
-                    "url": m["url"],
+                    "url": u_cand,
                     "thumbnail": m.get("thumbnail_url"),
                     "ext": "mp4" if k == "video" else "jpg",
                     "filesize": None,
@@ -2319,6 +2441,7 @@ def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None
                 "vcodec": vcodec,
                 "acodec": acodec,
                 "ext": ext,
+                "format_id": info.get("format_id"),
                 "width": info.get("width"),
                 "height": info.get("height"),
                 "duration": info.get("duration"),
@@ -2349,25 +2472,48 @@ def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None
             "duration": f.get("duration") or info.get("duration"),
         })
 
-    progressive = [c for c in candidates if c["has_both"] and c["filesize"] and c["filesize"] <= max_bytes]
-    if progressive:
-        return max(progressive, key=lambda c: c["filesize"])
+    def stream_quality_score(c: dict) -> tuple:
+        h = c.get("height") or 0
+        w = c.get("width") or 0
+        res = h * w if (h and w) else h * 1000
+        is_hd = 1 if (c.get("format_id") in ("hd", "high") or h >= 720) else 0
+        sz = c.get("filesize") or 0
+        return (is_hd, res, sz)
 
-    prog_unsized = [c for c in candidates if c["has_both"]]
-    if prog_unsized:
-        return prog_unsized[-1]
+    # Detect maximum video resolution available across all formats (e.g. 1080p DASH streams on YouTube)
+    max_avail_height = 0
+    if is_video:
+        for f in (info.get("formats") or []):
+            if f.get("vcodec") not in (None, "none"):
+                fh = f.get("height") or 0
+                if fh > max_avail_height:
+                    max_avail_height = fh
+
+    # Filter progressive streams that have both audio and video
+    valid_prog = []
+    for c in candidates:
+        if not c["has_both"]:
+            continue
+        # If source has HD streams (>= 720p), do NOT settle for low-res (< 720p, e.g. 360p format 18 on YouTube).
+        # Returning None forces yt-dlp to download and merge pristine HD video + audio!
+        if is_video and max_avail_height >= 720 and (c.get("height") or 0) < 720:
+            continue
+        if c.get("filesize") and c["filesize"] > max_bytes:
+            continue
+        valid_prog.append(c)
+
+    if valid_prog:
+        return max(valid_prog, key=stream_quality_score)
 
     # For video: Never pick a video-only DASH stream without audio!
-    # Returning None forces yt-dlp to download and merge both video + audio streams into a full video with sound.
+    # Returning None forces yt-dlp to download and merge both video + audio streams into full HD video with sound.
     if is_video:
         return None
 
-    sized = [c for c in candidates if c["filesize"] and c["filesize"] <= max_bytes]
-    if sized:
-        return max(sized, key=lambda c: c["filesize"])
-
-    if candidates:
-        return candidates[-1]
+    # For photos / non-video items: pick highest resolution or largest size
+    valid_photos = [c for c in candidates if not c.get("filesize") or c["filesize"] <= max_bytes]
+    if valid_photos:
+        return max(valid_photos, key=stream_quality_score)
 
     return None
 
