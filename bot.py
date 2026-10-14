@@ -1333,20 +1333,188 @@ def extract_ig_embed(clean_url: str) -> dict | None:
     return None
 
 
+def extract_ig_graphql(shortcode: str) -> dict | None:
+    """Query Instagram GraphQL endpoint for full shortcode media details (especially carousels)."""
+    if not shortcode:
+        return None
+    try:
+        url = "https://www.instagram.com/graphql/query"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "*/*",
+        }
+        data = {
+            "doc_id": "8845758582119845",
+            "variables": json.dumps({
+                "shortcode": shortcode,
+                "fetch_tagged_user_count": None,
+                "hoisted_comment_id": None,
+                "hoisted_reply_id": None,
+            }),
+        }
+        cookies_jar = get_loaded_cookiejar()
+        resp = HTTP_SESSION.post(url, headers=headers, data=data, cookies=cookies_jar, timeout=EXTRACT_TIMEOUT)
+        if resp.status_code != 200:
+            log.debug("Instagram GraphQL returned %d for shortcode %s", resp.status_code, shortcode)
+            return None
+
+        res_json = resp.json()
+        data_obj = res_json.get("data", {})
+        media = data_obj.get("xdt_shortcode_media") or data_obj.get("shortcode_media")
+        if not media:
+            return None
+
+        owner = media.get("owner", {})
+        uploader = owner.get("username") or owner.get("full_name") or ""
+        caption_edges = media.get("edge_media_to_caption", {}).get("edges", [])
+        caption = caption_edges[0].get("node", {}).get("text", "") if caption_edges else ""
+
+        children = media.get("edge_sidecar_to_children", {}).get("edges", [])
+        if children:
+            items = []
+            for child in children:
+                node = child.get("node", {})
+                is_vid = node.get("is_video", False)
+                u = node.get("video_url") if is_vid else node.get("display_url")
+                if u:
+                    items.append({"url": u, "kind": "video" if is_vid else "photo"})
+            if items:
+                log.info("Instagram GraphQL parsed %d carousel items for %s", len(items), shortcode)
+                return {
+                    "_kind": "album",
+                    "items": items,
+                    "title": caption,
+                    "description": caption,
+                    "uploader": f"@{uploader}" if uploader else "",
+                }
+        else:
+            is_vid = media.get("is_video", False)
+            u = media.get("video_url") if is_vid else media.get("display_url")
+            if u:
+                log.info("Instagram GraphQL parsed single %s for %s", "video" if is_vid else "photo", shortcode)
+                return {
+                    "_kind": "video" if is_vid else "photo",
+                    "url": u,
+                    "ext": "mp4" if is_vid else "jpg",
+                    "filesize": None,
+                    "title": caption,
+                    "description": caption,
+                    "uploader": f"@{uploader}" if uploader else "",
+                }
+    except Exception as e:
+        log.debug("Instagram GraphQL query exception for %s: %s", shortcode, e)
+    return None
+
+
+def gallerydl_extract(url: str, use_cookies: bool = True) -> dict | None:
+    """Extract media items using gallery-dl (superb for Instagram photo/carousel albums)."""
+    if not shutil.which("gallery-dl"):
+        return None
+
+    is_ig = "instagram.com" in url.lower()
+    clean_target = re.sub(r"\?.*$", "", url).rstrip("/") + "/" if is_ig else url
+
+    cmd = ["gallery-dl", "-j", "--no-part"]
+    if use_cookies and has_active_cookies() and is_ig:
+        cmd.extend(["--cookies", COOKIES_FILE_PATH])
+    cmd.append(clean_target)
+
+    log.info("Running gallery-dl (cookies=%s) for %s", bool(use_cookies and has_active_cookies() and is_ig), clean_target)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=EXTRACT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.warning("gallery-dl timed out for %s", url)
+        return None
+    except Exception as e:
+        log.warning("gallery-dl run exception for %s: %s", url, e)
+        return None
+
+    if result.returncode != 0:
+        log.info("gallery-dl could not extract %s: %s", url, (result.stderr or "").strip()[-300:])
+        return None
+
+    items = []
+    caption = ""
+    uploader = ""
+
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            # gallery-dl JSON format: [msg_type, metadata_dict, target_url]
+            if isinstance(entry, list) and len(entry) >= 2:
+                meta = entry[1] if isinstance(entry[1], dict) else {}
+                media_url = entry[2] if len(entry) >= 3 and isinstance(entry[2], str) else meta.get("url")
+                if not media_url and meta.get("display_url"):
+                    media_url = meta.get("display_url")
+                if not media_url and meta.get("video_url"):
+                    media_url = meta.get("video_url")
+
+                if media_url:
+                    ext = meta.get("extension", "").lower()
+                    is_vid = ext in ("mp4", "mkv", "webm", "mov") or bool(meta.get("video_url"))
+                    kind = "video" if is_vid else "photo"
+                    if not any(it["url"] == media_url for it in items):
+                        items.append({"url": media_url, "kind": kind})
+
+                if not caption:
+                    caption = meta.get("description") or meta.get("caption") or ""
+                if not uploader:
+                    uploader = meta.get("username") or (meta.get("user", {}).get("username") if isinstance(meta.get("user"), dict) else meta.get("uploader") or "")
+        except Exception:
+            continue
+
+    if not items:
+        return None
+
+    uploader_str = f"@{uploader.lstrip('@')}" if uploader else ""
+    if len(items) > 1:
+        log.info("gallery-dl returned album with %d entries for %s", len(items), clean_target)
+        return {
+            "_kind": "album",
+            "items": items,
+            "title": caption,
+            "description": caption,
+            "uploader": uploader_str,
+        }
+    else:
+        first = items[0]
+        log.info("gallery-dl returned single %s for %s", first["kind"], clean_target)
+        return {
+            "formats": [],
+            "url": first["url"],
+            "ext": "mp4" if first["kind"] == "video" else "jpg",
+            "filesize": None,
+            "title": caption,
+            "description": caption,
+            "uploader": uploader_str,
+            "_kind": first["kind"],
+        }
+
+
 def extract_instagram(url: str) -> dict | None:
     """Extract Instagram post using Optimized Hybrid Pipeline:
-    1. Try Authenticated yt-dlp first if cookies active (Pristine 1080p source quality)
+    1. Reels or with cookies: Prioritize yt-dlp for full 1080p source quality
     2. Try Public Embed JSON (Fast ~0.5s, No cookies, full carousel and max resolution support)
-    3. Fallback: Public yt-dlp & Official oEmbed API
+    3. Try Instagram GraphQL API (Direct metadata, supports authenticated sessions and carousels)
+    4. Try gallery-dl (Superb for photo & carousel albums with/without cookies)
+    5. Fallback: Public yt-dlp & Official oEmbed API (for posts only, never for reels)
     """
     clean_url = re.sub(r"\?.*$", "", url).rstrip("/") + "/"
     log.info("Extracting Instagram (Hybrid Pipeline) for clean URL: %s", clean_url)
 
     use_auth = has_active_cookies()
     is_reel = "/reel/" in clean_url.lower()
+    m_sc = re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)", clean_url)
+    shortcode = m_sc.group(1) if m_sc else None
 
-    # 1. Prioritize yt-dlp for Reels or when authenticated cookies are active (Full 1080p pristine quality)
-    if use_auth or is_reel:
+    # 1. Prioritize yt-dlp for Reels or when authenticated cookies are active (Full 1080p pristine quality for video)
+    if is_reel or (use_auth and is_reel):
         log.info("Attempting yt-dlp extraction for Instagram (auth=%s, is_reel=%s) for %s", use_auth, is_reel, clean_url)
         ytdlp_res = ytdlp_extract(clean_url, use_cookies=use_auth)
         if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
@@ -1359,15 +1527,28 @@ def extract_instagram(url: str) -> dict | None:
         log.info("Instagram extracted via Public Embed (Zero Cookies)")
         return embed_info
 
-    # 3. Fallback: Try public yt-dlp if not run earlier
-    if not use_auth and not is_reel:
-        log.info("Attempting public yt-dlp extraction for Instagram: %s", clean_url)
-        ytdlp_res = ytdlp_extract(clean_url, use_cookies=False)
+    # 3. Try Instagram GraphQL API (Direct metadata, supports authenticated sessions and carousels)
+    if shortcode:
+        gql_info = extract_ig_graphql(shortcode)
+        if gql_info:
+            log.info("Instagram extracted via GraphQL API for %s", shortcode)
+            return gql_info
+
+    # 4. Try gallery-dl (Superb for photo & carousel albums with/without cookies)
+    gdl_res = gallerydl_extract(clean_url, use_cookies=use_auth)
+    if gdl_res and (gdl_res.get("_kind") == "album" or gdl_res.get("url") or gdl_res.get("items")):
+        log.info("Instagram extracted via gallery-dl (authenticated=%s)", use_auth)
+        return gdl_res
+
+    # 5. Fallback: Try yt-dlp if not run earlier (e.g. standard video posts)
+    if not is_reel:
+        log.info("Attempting yt-dlp extraction for Instagram (authenticated=%s) for %s", use_auth, clean_url)
+        ytdlp_res = ytdlp_extract(clean_url, use_cookies=use_auth)
         if ytdlp_res and (ytdlp_res.get("formats") or ytdlp_res.get("url") or ytdlp_res.get("entries")):
-            log.info("Instagram extracted via public yt-dlp")
+            log.info("Instagram extracted via yt-dlp")
             return ytdlp_res
 
-    # 4. Fallback: Try official oEmbed API (Public metadata & photo fallback for posts only, NEVER for reels)
+    # 6. Fallback: Try official oEmbed API (Public metadata & photo fallback for posts only, NEVER for reels)
     if not is_reel:
         try:
             api_url = f"https://www.instagram.com/api/v1/oembed/?url={quote(clean_url)}"
@@ -1397,6 +1578,7 @@ def extract_instagram(url: str) -> dict | None:
             log.info("extract_instagram oembed failed for %s: %s", clean_url, e)
 
     return None
+
 
 
 def is_avatar_url(u: str) -> bool:
@@ -2426,6 +2608,7 @@ def extract_info(url: str) -> dict | None:
         ig_info = extract_instagram(url)
         if ig_info:
             return ig_info
+        return None
 
     if "facebook.com" in url.lower() or "fb.watch" in url.lower():
         fb_info = extract_facebook(url)
