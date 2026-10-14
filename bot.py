@@ -300,7 +300,7 @@ def parse_cookie_input(raw: str) -> str | None:
 
 def init_db():
     os.makedirs(os.path.dirname(CACHE_DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(CACHE_DB_PATH)
+    conn = sqlite3.connect(CACHE_DB_PATH, check_same_thread=False)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS cache (
             url TEXT PRIMARY KEY,
@@ -348,7 +348,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind IN ('photo', 'text')) OR (kind = 'text' AND (url LIKE '%/vt.%' OR url LIKE '%/vm.%' OR url LIKE '%tiktok.com%')) OR (kind IN ('text', 'photo') AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%')) OR (kind = 'video' AND (url LIKE '%youtu%'))")
+        conn.execute("DELETE FROM cache WHERE url LIKE '%aoBSCdEOKx4%' OR caption NOT LIKE '%<blockquote>%' OR caption LIKE '%expandable%' OR url LIKE '%DeIwpiiRz9D%' OR caption LIKE '%...' OR url LIKE '%threads.%' OR url LIKE '%/share/%' OR (url LIKE '%tiktok.%' AND kind IN ('photo', 'text')) OR (kind = 'text' AND (url LIKE '%/vt.%' OR url LIKE '%/vm.%' OR url LIKE '%tiktok.com%')) OR (kind IN ('text', 'photo') AND (url LIKE '%facebook.com%' OR url LIKE '%fb.watch%')) OR (kind = 'video' AND (url LIKE '%youtu%')) OR (kind = 'photo' AND url LIKE '%instagram.com%' AND url LIKE '%img_index%')")
     except Exception as e:
         log.warning("Failed to purge stale threads/tiktok/caption cache: %s", e)
     try:
@@ -644,13 +644,20 @@ def purge_old_cache(days: int = CACHE_RETENTION_DAYS) -> int:
     """Purge cache entries older than specified days (default: 60 days / 2 months) and vacuum SQLite."""
     cutoff = time.time() - (days * 86400)
     try:
-        cursor = DB.execute("DELETE FROM cache WHERE created_at < ?", (cutoff,))
-        deleted_count = cursor.rowcount
-        DB.commit()
+        conn = sqlite3.connect(CACHE_DB_PATH, check_same_thread=False)
+        with conn:
+            if days == 0:
+                cursor = conn.execute("DELETE FROM cache")
+            else:
+                cursor = conn.execute("DELETE FROM cache WHERE created_at < ?", (cutoff,))
+            deleted_count = cursor.rowcount
+        conn.close()
         if deleted_count > 0:
             log.info("Purged %d cache entries older than %d days (%d months)", deleted_count, days, max(1, days // 30))
             try:
-                DB.execute("VACUUM")
+                conn_vac = sqlite3.connect(CACHE_DB_PATH, check_same_thread=False)
+                conn_vac.execute("VACUUM")
+                conn_vac.close()
             except Exception as ve:
                 log.debug("DB VACUUM note: %s", ve)
         return deleted_count
