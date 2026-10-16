@@ -3886,56 +3886,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     all_urls = [u.rstrip(".,;:!?)>]\"'") for u in URL_REGEX.findall(text)]
     if not all_urls:
-        # Chatbot handler: trigger if bot is tagged/mentioned or replied to in group
-        bot_info = context.bot
-        bot_username = (bot_info.username or "").lower()
-        is_reply_to_bot = bool(
-            message.reply_to_message
-            and message.reply_to_message.from_user
-            and message.reply_to_message.from_user.id == bot_info.id
-        )
-        is_bot_mentioned = bool(bot_username and f"@{bot_username}" in text.lower()) or is_reply_to_bot
-
-        if is_bot_mentioned and text and not text.startswith("/"):
-            clean_query = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE).strip() if bot_username else text
-            if not clean_query and message.reply_to_message:
-                clean_query = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
-            if clean_query:
-                user_id = user.id if user else 0
-                now = time.time()
-                last_ai_seen = USER_AI_LAST_SEEN.get(user_id, 0.0)
-                if (now - last_ai_seen) < 3.0:
-                    log.info("AI Rate limit active for user %s (%s). Cooldown: %.1fs left", user_info, user_id, 3.0 - (now - last_ai_seen))
-                    return
-                USER_AI_LAST_SEEN[user_id] = now
-
-                stop_event = asyncio.Event()
-                typing_task = asyncio.create_task(send_typing_loop(context.bot, message.chat_id, stop_event))
-                try:
-                    caller_name, caller_context = get_caller_identity_info(user)
-                    system_prompt = build_system_prompt_for_user(user, base_role="tanya")
-                    user_message_content = f"IDENTITAS PENANYA:\n{caller_context}\n\nPERTANYAAN DARI {caller_name.upper()}:\n{clean_query}"
-                    payload = {
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_message_content},
-                        ],
-                        "temperature": 0.5,
-                        "max_tokens": 800,
-                    }
-                    reply_content = await asyncio.to_thread(call_ai_api, payload)
-                    if reply_content:
-                        cleaned_reply = sanitize_ai_reply(reply_content.strip())
-                        log.info("🤖 [AI BALAS MENTION ke %s]: %s", user_info, cleaned_reply.replace('\n', ' ')[:150])
-                        try:
-                            await message.reply_text(cleaned_reply, parse_mode=ParseMode.MARKDOWN)
-                        except Exception:
-                            await message.reply_text(cleaned_reply)
-                except Exception as e_ai:
-                    log.warning("Error responding to mention: %s", e_ai)
-                finally:
-                    stop_event.set()
-                    await typing_task
         return
 
     urls = [u for u in all_urls if looks_supported(u)]
