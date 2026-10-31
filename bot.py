@@ -2701,9 +2701,10 @@ def pick_direct_url(info: dict, max_bytes: int = 50 * 1024 * 1024) -> dict | Non
         fmt_id = str(c.get("format_id") or "").lower()
         is_hd = 1 if (fmt_id in ("hd", "high") or h >= 720) else 0
 
-        # Prefer standard H.264 over HEVC/bytevc1/vp9 for direct streaming compatibility in Telegram
+        # Standard H.264 (avc) is universally supported by Telegram without transcode errors.
+        # Problematic codecs (bytevc1, hevc, vp9) often cause Telegram API 400 errors or transcoding degradation.
         vc = str(c.get("vcodec") or "").lower()
-        codec_pref = 2 if (vc.startswith("avc") or "h264" in vc) else (1 if vc not in ("none", "") else 0)
+        codec_pref = 2 if (vc.startswith("avc") or "h264" in vc) else (0 if ("bytevc1" in vc or "vp9" in vc or "hevc" in vc or "h265" in vc) else 1)
 
         fmt_pref = 0
         if fmt_id in ("hd", "high"):
@@ -2714,7 +2715,7 @@ def pick_direct_url(info: dict, max_bytes: int = 50 * 1024 * 1024) -> dict | Non
             fmt_pref = int(fmt_id)
 
         sz = c.get("filesize") or 0
-        return (is_hd, res, codec_pref, fmt_pref, sz)
+        return (codec_pref, is_hd, res, fmt_pref, sz)
 
     # Detect maximum video resolution available across all formats (e.g. 1080p DASH streams on YouTube)
     max_avail_height = 0
@@ -4669,8 +4670,8 @@ async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
             kind = "animation"
 
         relay_url = build_relay_url(direct["url"], kind, ext)
-        width = direct.get("width") or None
-        height = direct.get("height") or None
+        width = direct.get("width") or (info.get("width") if info else None) or None
+        height = direct.get("height") or (info.get("height") if info else None) or None
         duration = int(direct["duration"]) if direct.get("duration") else None
 
         thumb_input = None
