@@ -75,7 +75,7 @@ MAX_RELAY_BYTES = int(os.environ.get("MAX_RELAY_BYTES", 20 * 1024 * 1024))
 CACHE_RETENTION_DAYS = int(os.environ.get("CACHE_RETENTION_DAYS", "60"))
 EXTRACT_TIMEOUT = int(os.environ.get("EXTRACT_TIMEOUT", 30))
 COURTESY_DELAY = float(os.environ.get("COURTESY_DELAY", 0.0))
-RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 10.0))
+RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", 2.0))
 ROUTER_API_URL = os.environ.get("ROUTER_API_URL", "https://router.azrim.my.id/v1/chat/completions")
 ROUTER_API_KEY = (
     os.environ.get("ROUTER_API_KEY", "")
@@ -926,7 +926,7 @@ def extract_tiktok(url: str) -> dict | None:
     if url not in urls_to_try:
         urls_to_try.append(url)
 
-    endpoints = ["https://tikwm.com/api/", "https://www.tikwm.com/api/"]
+    endpoints = ["https://tikwm.com/api/"]
 
     def _parse_tikwm_data(data: dict, ep: str) -> dict | None:
         title = data.get("title") or ""
@@ -981,7 +981,7 @@ def extract_tiktok(url: str) -> dict | None:
 
         best_url = None
         best_size = None
-        if hd_play and hd_size and hd_size <= MAX_RELAY_BYTES:
+        if hd_play and hd_size and hd_size <= 50 * 1024 * 1024:
             best_url = hd_play
             best_size = hd_size
             log.info("TikTok HD video selected via TikWM (%s, size: %s bytes)", ep, hd_size)
@@ -1029,7 +1029,7 @@ def extract_tiktok(url: str) -> dict | None:
         # 1. Try POST with hd=1 first
         try:
             log.info("Querying TikTok via TikWM (%s) for %s", ep, cand_url)
-            resp = HTTP_SESSION.post(ep, data={"url": cand_url, "hd": "1"}, timeout=12)
+            resp = HTTP_SESSION.post(ep, data={"url": cand_url, "hd": "1"}, timeout=6)
             if resp.status_code == 200:
                 res_json = resp.json()
                 if res_json.get("code") == 0:
@@ -1043,7 +1043,7 @@ def extract_tiktok(url: str) -> dict | None:
 
         # 2. Try GET fallback if POST returned error
         try:
-            resp = HTTP_SESSION.get(f"{ep}?url={quote(cand_url)}&hd=1", timeout=12)
+            resp = HTTP_SESSION.get(f"{ep}?url={quote(cand_url)}&hd=1", timeout=6)
             if resp.status_code == 200:
                 res_json = resp.json()
                 if res_json.get("code") == 0:
@@ -1535,17 +1535,18 @@ def extract_instagram(url: str) -> dict | None:
         return embed_info
 
     # 3. Try Instagram GraphQL API (Direct metadata, supports authenticated sessions and carousels)
-    if shortcode:
+    if shortcode and use_auth:
         gql_info = extract_ig_graphql(shortcode)
         if gql_info:
             log.info("Instagram extracted via GraphQL API for %s", shortcode)
             return gql_info
 
-    # 4. Try gallery-dl (Superb for photo & carousel albums with/without cookies)
-    gdl_res = gallerydl_extract(clean_url, use_cookies=use_auth)
-    if gdl_res and (gdl_res.get("_kind") == "album" or gdl_res.get("url") or gdl_res.get("items")):
-        log.info("Instagram extracted via gallery-dl (authenticated=%s)", use_auth)
-        return gdl_res
+    # 4. Try gallery-dl (Superb for photo & carousel albums with authenticated session)
+    if use_auth:
+        gdl_res = gallerydl_extract(clean_url, use_cookies=True)
+        if gdl_res and (gdl_res.get("_kind") == "album" or gdl_res.get("url") or gdl_res.get("items")):
+            log.info("Instagram extracted via gallery-dl (authenticated=True)")
+            return gdl_res
 
     # 5. Fallback: Try yt-dlp if not run earlier (e.g. standard video posts)
     if not is_reel:
@@ -2054,10 +2055,12 @@ def extract_facebook(url: str) -> dict | None:
     """Extract Facebook media (video, reels, photo, album, or text) via yt-dlp & OpenGraph scraper."""
     clean_url = url.strip()
     is_video_hint = any(k in clean_url.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/", "/share/v/", "/share/r/", "video.php"])
+    tried_ytdlp_urls = set()
 
     # 1. If it's explicitly a video/reel URL, try yt-dlp first
     if is_video_hint:
         try:
+            tried_ytdlp_urls.add(clean_url)
             info = ytdlp_extract(clean_url)
             if info is not None:
                 if info.get("_kind") != "album":
@@ -2107,8 +2110,11 @@ def extract_facebook(url: str) -> dict | None:
 
     # Check canonical candidates for video / reel hints (e.g. facebook.com/share link resolving to /reel/)
     for cand in canonical_candidates:
+        if cand in tried_ytdlp_urls:
+            continue
         if any(k in cand.lower() for k in ["/reel/", "/watch", "fb.watch", "/videos/"]):
             try:
+                tried_ytdlp_urls.add(cand)
                 info = ytdlp_extract(cand)
                 if info is not None:
                     if info.get("_kind") != "album":
@@ -2161,8 +2167,9 @@ def extract_facebook(url: str) -> dict | None:
 
             # Try extracting HD stream via yt-dlp first (Facebook's og:video is usually low-res SD 360p)
             for cand in canonical_candidates + [clean_url]:
-                if cand:
+                if cand and cand not in tried_ytdlp_urls:
                     try:
+                        tried_ytdlp_urls.add(cand)
                         info_hd = ytdlp_extract(cand)
                         if info_hd and (info_hd.get("formats") or info_hd.get("url")):
                             log.info("Facebook HD video extracted via yt-dlp for %s", cand)
@@ -2636,7 +2643,7 @@ def extract_info(url: str) -> dict | None:
     return og_scrape_fallback(url)
 
 
-def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None:
+def pick_direct_url(info: dict, max_bytes: int = 50 * 1024 * 1024) -> dict | None:
     is_video = info.get("_kind") == "video" or any(f.get("vcodec") not in (None, "none") for f in info.get("formats", []))
     candidates = []
 
@@ -2691,9 +2698,23 @@ def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None
         h = c.get("height") or 0
         w = c.get("width") or 0
         res = h * w if (h and w) else h * 1000
-        is_hd = 1 if (c.get("format_id") in ("hd", "high") or h >= 720) else 0
+        fmt_id = str(c.get("format_id") or "").lower()
+        is_hd = 1 if (fmt_id in ("hd", "high") or h >= 720) else 0
+
+        # Prefer standard H.264 over HEVC/bytevc1/vp9 for direct streaming compatibility in Telegram
+        vc = str(c.get("vcodec") or "").lower()
+        codec_pref = 2 if (vc.startswith("avc") or "h264" in vc) else (1 if vc not in ("none", "") else 0)
+
+        fmt_pref = 0
+        if fmt_id in ("hd", "high"):
+            fmt_pref = 100
+        elif fmt_id in ("sd", "medium"):
+            fmt_pref = 50
+        elif fmt_id.isdigit():
+            fmt_pref = int(fmt_id)
+
         sz = c.get("filesize") or 0
-        return (is_hd, res, sz)
+        return (is_hd, res, codec_pref, fmt_pref, sz)
 
     # Detect maximum video resolution available across all formats (e.g. 1080p DASH streams on YouTube)
     max_avail_height = 0
@@ -2710,8 +2731,11 @@ def pick_direct_url(info: dict, max_bytes: int = MAX_RELAY_BYTES) -> dict | None
         if not c["has_both"]:
             continue
         # If source has HD streams (>= 720p), do NOT settle for low-res (< 720p, e.g. 360p format 18 on YouTube).
-        # Returning None forces yt-dlp to download and merge pristine HD video + audio!
-        if is_video and max_avail_height >= 720 and (c.get("height") or 0) < 720:
+        # NOTE: Only skip if format height is explicitly known to be < 720p (c_h is not None and 0 < c_h < 720).
+        # Instagram/Reddit/Facebook formats often have height=None for progressive streams (formats 1, 2, 3),
+        # so treating None as 0 would incorrectly skip them!
+        c_h = c.get("height")
+        if is_video and max_avail_height >= 720 and c_h is not None and 0 < c_h < 720:
             continue
         if c.get("filesize") and c["filesize"] > max_bytes:
             continue
@@ -4415,17 +4439,18 @@ async def download_and_send_via_ytdlp(
 async def process_link(url: str, message, context: ContextTypes.DEFAULT_TYPE):
     log.info("Processing link: %s", url)
 
-    # Immediately trigger native Telegram chat action for instant feedback
-    try:
-        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-    except Exception as e:
-        log.debug("send_chat_action notice: %s", e)
-
+    # Send status message first for immediate visual response
     status_msg = None
     try:
-        status_msg = await message.reply_text("Fetching media...")
+        status_msg = await message.reply_text("⏳ Sedang memproses media...")
     except Exception as e:
         log.warning("Could not send status message: %s", e)
+
+    # Trigger native Telegram chat action in background task so network latency does not block status message
+    try:
+        asyncio.create_task(context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT))
+    except Exception as e:
+        log.debug("send_chat_action notice: %s", e)
 
     try:
         cached = cache_get(url)
